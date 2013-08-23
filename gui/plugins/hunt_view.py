@@ -13,8 +13,11 @@ import StringIO
 import urllib
 
 
-from django import http
-import matplotlib.pyplot as plt
+import matplotlib
+# We need to select a non interactive backend for matplotlib.
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # pylint: disable-msg=g-import-not-at-top
 
 import logging
 
@@ -877,23 +880,7 @@ No data to graph yet.
     super(HuntClientGraphRenderer, self).Layout(request, response)
 
 
-class ImageDownloadRenderer(renderers.TemplateRenderer):
-
-  mimetype = "image/png"
-
-  def Content(self, request, response):
-    _ = request, response
-    return ""
-
-  def Download(self, request, response):
-
-    response = http.HttpResponse(content=self.Content(request, response),
-                                 mimetype=self.mimetype)
-
-    return response
-
-
-class HuntClientCompletionGraphRenderer(ImageDownloadRenderer):
+class HuntClientCompletionGraphRenderer(renderers.ImageDownloadRenderer):
 
   def Content(self, request, _):
     """Generates the actual image to display."""

@@ -2,6 +2,7 @@
 """This is a selenium test harness used interactively with Selenium IDE."""
 
 import copy
+import socket
 import threading
 import urllib
 from wsgiref import simple_server
@@ -37,11 +38,16 @@ class DjangoThread(threading.Thread):
   def run(self):
     """Run the django server in a thread."""
     logging.info("Base URL is %s", self.base_url)
+    port = config_lib.CONFIG["AdminUI.port"]
+    logging.info("Django listening on port %d.", port)
+    try:
+      # Make a simple reference implementation WSGI server
+      server = simple_server.make_server("0.0.0.0", port,
+                                         wsgi.WSGIHandler())
+    except socket.error as e:
+      raise socket.error(
+          "Error while listening on port %d: %s." % (port, str(e)))
 
-    # Make a simple reference implementation WSGI server
-    server = simple_server.make_server("0.0.0.0",
-                                       config_lib.CONFIG["AdminUI.port"],
-                                       wsgi.WSGIHandler())
     while self.keep_running:
       server.handle_request()
 
@@ -116,7 +122,9 @@ def main(_):
       "Test Context",
       "Context applied when we run tests.")
 
-  startup.TestInit()
+  # This is a standalone program and might need to use the config
+  # file.
+  startup.Init()
 
   # Tests must be imported after django is initialized.
   # pylint: disable=g-import-not-at-top,unused-variable

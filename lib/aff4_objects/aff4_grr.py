@@ -91,6 +91,14 @@ class VFSGRRClient(standard.VFSDirectory):
     INSTALL_DATE = aff4.Attribute("metadata:install_date", rdfvalue.RDFDatetime,
                                   "Install Date.", "Install")
 
+    # The knowledge base is used for storing data about the host and users.
+    # This is currently a slightly odd object as we only use some of the fields.
+    # The proto itself is used in Artifact handling outside of GRR (e.g. Plaso).
+    # Over time we will migrate fields into this proto, but for now it is a mix.
+    KNOWLEDGE_BASE = aff4.Attribute("metadata:knowledge_base",
+                                    rdfvalue.KnowledgeBase,
+                                    "Artifact Knowledge Base", "KnowledgeBase")
+
     # Deprecated for new clients - DO NOT USE.
     GRR_CONFIG = aff4.Attribute("aff4:client_config", rdfvalue.GRRConfig,
                                 "Running configuration for the GRR client.")
@@ -204,10 +212,21 @@ class VFSGRRClient(standard.VFSDirectory):
       result = [VFSGRRClient.AFF4_PREFIXES[pathspec[0].pathtype]]
 
     for p in pathspec:
+      component = p.path
+
+      # The following encode different pathspec properties into the AFF4 path in
+      # such a way that unique files on the client are mapped to unique URNs in
+      # the AFF4 space. Note that this transformation does not need to be
+      # reversible since we always use the PathSpec when accessing files on the
+      # client.
       if p.HasField("offset"):
-        result.append(p.path + ":" + str(p.offset / 512))
-      else:
-        result.append(p.path)
+        component += ":" + str(p.offset / 512)
+
+      # Support ADS names.
+      if p.HasField("stream_name"):
+        component += ":" + p.stream_name
+
+      result.append(component)
 
     return client_urn.Add("/".join(result))
 
@@ -334,7 +353,7 @@ class VFSAnalysisFile(VFSFile):
 class GRRSignedBlob(aff4.AFF4MemoryStream):
   """A container for storing a signed binary blob such as a driver."""
 
-  class SchemaCls(aff4.AFF4Object.SchemaCls):
+  class SchemaCls(aff4.AFF4MemoryStream.SchemaCls):
     """Signed blob attributes."""
 
     BINARY = aff4.Attribute("aff4:signed_blob", rdfvalue.SignedBlob,
@@ -348,8 +367,9 @@ class GRRSignedBlob(aff4.AFF4MemoryStream):
       contents = self.Get(self.Schema.BINARY)
       if contents:
         contents = contents.data
+
     self.fd = StringIO.StringIO(contents)
-    self.size = rdfvalue.RDFInteger(self.fd.len)
+    self.size = self.fd.len
 
 
 class GRRMemoryDriver(GRRSignedBlob):

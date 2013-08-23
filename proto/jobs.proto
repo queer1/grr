@@ -618,6 +618,11 @@ message PathSpec {
   optional PathType pathtype = 1 [default = UNSET];
 
   optional string path = 2;
+
+  optional string stream_name = 11 [(sem_type) = {
+      description: "A name for the data stream. For example, an ADS name."
+    }];
+
   optional string mount_point = 3;
   optional PathSpec nested_path = 5;
 
@@ -883,6 +888,13 @@ message GRRConfig {
   optional bool process_separate = 15;   // deprecated
   optional float rss_max = 16;
 };
+
+
+message AuthenticodeSignedData {
+  optional uint64 revision = 1;
+  optional uint64 cert_type = 2;
+  optional bytes certificate = 3;
+}
 
 
 message FingerprintTuple {
