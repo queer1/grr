@@ -262,7 +262,7 @@ the client facing server and the admin user interface.\n"""
   try:
     hostname = maintenance_utils.GuessPublicHostname()
     print "Using %s as public hostname" % hostname
-  except OSError:
+  except (OSError, socket.gaierror):
     print "Sorry, we couldn't guess your public hostname"
     hostname = raw_input(
         "Please enter it manually e.g. grr.example.com: ").strip()
