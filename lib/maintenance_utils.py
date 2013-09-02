@@ -191,7 +191,12 @@ def CreateBinaryConfigPaths(token=None):
 def GuessPublicHostname():
   """Attempt to guess a public host name for this machine."""
   local_hostname = socket.gethostname()
-  local_ip = socket.gethostbyname(local_hostname)
+  
+  try:
+    local_ip = socket.gethostbyname(local_hostname)
+  except:
+    raise
+  
   if not ipaddr.IPAddress(local_ip).is_private:
     # The host name resolves and is not private.
     return local_hostname
