@@ -5,22 +5,26 @@
 import os
 
 
-from django.conf.urls import defaults
+from django.conf import urls
 
 from grr import gui
 
 document_root = os.path.join(os.path.dirname(gui.__file__), "static")
+help_root = os.path.join(os.path.dirname(os.path.dirname(gui.__file__)), "docs")
 
 django_base = "django."
 view_base = "grr.gui.views."
-handler500 = "defaults.handler404"
+handler404 = "urls.handler404"
 handler500 = "views.ServerError"
 
-urlpatterns = defaults.patterns(
+urlpatterns = urls.patterns(
     "",
     (r"^$", view_base + "Homepage"),
     # Automatic rendering is done here
     (r"^render/[^/]+/.*", view_base + "RenderGenericRenderer"),
+    (r"^download/[^/]+/.*", view_base + "RenderBinaryDownload"),
     (r"^static/(.*)$", django_base + "views.static.serve",
      {"document_root": document_root}),
+    (r"^help/(.*)$", django_base + "views.static.serve",
+     {"document_root": help_root}),
 )

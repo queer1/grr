@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
-
 """Tests for the hunt."""
 
 
@@ -12,6 +10,7 @@ import logging
 
 # pylint: disable=unused-import,g-bad-import-order
 from grr.lib import server_plugins
+from grr.lib.hunts import tests
 # pylint: enable=unused-import,g-bad-import-order
 
 from grr.lib import aff4
@@ -22,6 +21,19 @@ from grr.lib import flow
 from grr.lib import hunts
 from grr.lib import rdfvalue
 from grr.lib import test_lib
+
+
+class TestHuntListener(flow.EventListener):
+  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:TestHuntDone")
+  EVENTS = ["TestHuntDone"]
+
+  received_events = []
+
+  @flow.EventHandler(auth_required=True)
+  def ProcessMessage(self, message=None, event=None):
+    _ = event
+    # Store the results for later inspection.
+    self.__class__.received_events.append(message)
 
 
 class BrokenSampleHunt(hunts.SampleHunt):
@@ -41,29 +53,57 @@ class BrokenSampleHunt(hunts.SampleHunt):
     self.MarkClientDone(client_id)
 
 
+class DummyHunt(hunts.GRRHunt):
+  """Dummy hunt that stores client ids in a class variable."""
+
+  client_ids = []
+
+  @flow.StateHandler()
+  def RunClient(self, responses):
+    for client_id in responses:
+      DummyHunt.client_ids.append(client_id)
+      self.MarkClientDone(client_id)
+
+
 class HuntTest(test_lib.FlowTestsBaseclass):
   """Tests the Hunt."""
 
-  def testRuleAdding(self):
+  def setUp(self):
+    super(HuntTest, self).setUp()
 
+    with test_lib.Stubber(time, "time", lambda: 0):
+      # Clean up the foreman to remove any rules.
+      with aff4.FACTORY.Open("aff4:/foreman", mode="rw",
+                             token=self.token) as foreman:
+        foreman.Set(foreman.Schema.RULES())
+
+    DummyHunt.client_ids = []
+
+  def testRuleAdding(self):
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     rules = foreman.Get(foreman.Schema.RULES)
-    # Make sure there are no rules yet.
+    # Make sure there are no rules yet in the foreman.
     self.assertEqual(len(rules), 0)
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="HUNT")
+    hunt = hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        regex_rules=[
+            rdfvalue.ForemanAttributeRegex(
+                attribute_name="GRR client",
+                attribute_regex="HUNT")
+            ],
+        integer_rules=[
+            rdfvalue.ForemanAttributeInteger(
+                attribute_name="Clock",
+                operator=rdfvalue.ForemanAttributeInteger.Operator.GREATER_THAN,
+                value=1336650631137737)
+            ],
+        client_rate=0,
+        token=self.token)
 
-    int_rule = rdfvalue.ForemanAttributeInteger(
-        attribute_name="Clock",
-        operator=rdfvalue.ForemanAttributeInteger.Operator.GREATER_THAN,
-        value=1336650631137737)
-
-    hunt.AddRule([int_rule, regex_rule])
     # Push the rules to the foreman.
-    hunt.Run()
+    with hunt.GetRunner() as runner:
+      runner.Start()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     rules = foreman.Get(foreman.Schema.RULES)
@@ -86,7 +126,8 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     self.assertEqual(rule.actions[0].hunt_name, "SampleHunt")
 
     # Running a second time should not change the rules any more.
-    hunt.Run()
+    with hunt.GetRunner() as runner:
+      runner.Start()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     rules = foreman.Get(foreman.Schema.RULES)
@@ -96,7 +137,7 @@ class HuntTest(test_lib.FlowTestsBaseclass):
 
   def AddForemanRules(self, to_add):
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
-    rules = foreman.Get(foreman.Schema.RULES) or foreman.Schema.RULES()
+    rules = foreman.Get(foreman.Schema.RULES, default=foreman.Schema.RULES())
     for rule in to_add:
       rules.Append(rule)
     foreman.Set(foreman.Schema.RULES, rules)
@@ -107,10 +148,11 @@ class HuntTest(test_lib.FlowTestsBaseclass):
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     rules = foreman.Get(foreman.Schema.RULES)
+
     # Make sure there are no rules yet.
     self.assertEqual(len(rules), 0)
-    now = int(time.time() * 1e6)
-    expires = now + 3600
+    now = rdfvalue.RDFDatetime().Now()
+    expires = rdfvalue.Duration("1h").Expiry()
     # Add some rules.
     rules = [rdfvalue.ForemanRule(created=now, expires=expires,
                                   description="Test rule1"),
@@ -118,19 +160,24 @@ class HuntTest(test_lib.FlowTestsBaseclass):
                                   description="Test rule2")]
     self.AddForemanRules(rules)
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="HUNT")
-    int_rule = rdfvalue.ForemanAttributeInteger(
-        attribute_name="Clock",
-        operator=rdfvalue.ForemanAttributeInteger.Operator.GREATER_THAN,
-        value=1336650631137737)
-    # Fire on either of the rules.
-    hunt.AddRule([int_rule])
-    hunt.AddRule([regex_rule])
-    # Push the rules to the foreman.
-    hunt.Run()
+    hunt = hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        regex_rules=[
+            rdfvalue.ForemanAttributeRegex(
+                attribute_name="GRR client",
+                attribute_regex="HUNT")
+            ],
+        integer_rules=[
+            rdfvalue.ForemanAttributeInteger(
+                attribute_name="Clock",
+                operator=rdfvalue.ForemanAttributeInteger.Operator.GREATER_THAN,
+                value=1336650631137737)
+            ],
+        client_rate=0,
+        token=self.token)
+
+    with hunt.GetRunner() as runner:
+      runner.Start()
 
     # Add some more rules.
     rules = [rdfvalue.ForemanRule(created=now, expires=expires,
@@ -141,43 +188,54 @@ class HuntTest(test_lib.FlowTestsBaseclass):
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     rules = foreman.Get(foreman.Schema.RULES)
-    self.assertEqual(len(rules), 6)
-    self.assertNotEqual(hunt.OutstandingRequests(), 0)
+    self.assertEqual(len(rules), 5)
 
-    # Now we stop the hunt.
-    hunt.Stop()
+    # It should be running.
+    with hunt.GetRunner() as runner:
+      self.assertTrue(runner.IsHuntStarted())
+
+      # Now we stop the hunt.
+      runner.Stop()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     rules = foreman.Get(foreman.Schema.RULES)
     # The rule for this hunt should be deleted but the rest should be there.
     self.assertEqual(len(rules), 4)
+
     # And the hunt should report no outstanding requests any more.
-    self.assertEqual(hunt.OutstandingRequests(), 0)
+    with hunt.GetRunner() as runner:
+      self.assertFalse(runner.IsHuntStarted())
 
   def testInvalidRules(self):
     """Tests the behavior when a wrong attribute name is passed in a rule."""
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="no such attribute",
-        attribute_regex="HUNT")
-    self.assertRaises(RuntimeError, hunt.AddRule, [regex_rule])
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="BrokenSampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="no such attribute",
+            attribute_regex="HUNT")],
+        client_rate=0,
+        token=self.token) as hunt:
 
-  def Callback(self, hunt_id, client_id, client_limit):
-    self.called.append((hunt_id, client_id, client_limit))
+      with hunt.GetRunner() as runner:
+        self.assertRaises(ValueError, runner.Start)
+
+  def Callback(self, hunt_id, client_id):
+    self.called.append((hunt_id, client_id))
 
   def testCallback(self, client_limit=None):
     """Checks that the foreman uses the callback specified in the action."""
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_limit=client_limit,
+        client_rate=0,
+        token=self.token) as hunt:
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", client_limit=client_limit,
-                                   token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
-
-    foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
+      with hunt.GetRunner() as runner:
+        runner.Start()
 
     # Create a client that matches our regex.
     client = aff4.FACTORY.Open(self.client_id, mode="rw", token=self.token)
@@ -186,9 +244,8 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     client.Set(client.Schema.CLIENT_INFO, info)
     client.Close()
 
-    old_start_client = hunts.SampleHunt.StartClient
-    try:
-      hunts.SampleHunt.StartClient = self.Callback
+    foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
+    with test_lib.Stubber(hunts.SampleHunt, "StartClient", self.Callback):
       self.called = []
 
       foreman.AssignTasksToClient(client.urn)
@@ -196,24 +253,21 @@ class HuntTest(test_lib.FlowTestsBaseclass):
       self.assertEqual(len(self.called), 1)
       self.assertEqual(self.called[0][1], client.urn)
 
-      # Clean up.
-      foreman.Set(foreman.Schema.RULES())
-      foreman.Close()
-    finally:
-      hunts.SampleHunt.StartClient = staticmethod(old_start_client)
-
   def testStartClient(self):
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt", client_rate=0, token=self.token) as hunt:
 
-    client = aff4.FACTORY.Open(self.client_id, token=self.token,
-                               age=aff4.ALL_TIMES)
+      with hunt.GetRunner() as runner:
+        runner.Start()
 
-    flows = list(client.GetValuesForAttribute(client.Schema.FLOW))
+        client = aff4.FACTORY.Open(self.client_id, token=self.token,
+                                   age=aff4.ALL_TIMES)
 
-    self.assertEqual(flows, [])
+        flows = list(client.GetValuesForAttribute(client.Schema.FLOW))
 
-    hunts.GRRHunt.StartClient(hunt.session_id, self.client_id)
+        self.assertEqual(flows, [])
+
+        hunts.GRRHunt.StartClient(hunt.session_id, self.client_id)
 
     test_lib.TestHuntHelper(None, [self.client_id], False, self.token)
 
@@ -237,12 +291,16 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     # Set up 10 clients.
     client_ids = self.SetupClients(10)
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_rate=0,
+        token=self.token) as hunt:
+
+      with hunt.GetRunner() as runner:
+        runner.Start()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
@@ -262,10 +320,6 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     self.assertEqual(len(set(started)), 10)
     self.assertEqual(len(set(finished)), 10)
 
-    # Clean up.
-    foreman.Set(foreman.Schema.RULES())
-    foreman.Close()
-
     self.DeleteClients(10)
 
   def testHangingClients(self):
@@ -273,12 +327,16 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     # Set up 10 clients.
     client_ids = self.SetupClients(10)
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_rate=0,
+        token=self.token) as hunt:
+
+      with hunt.GetRunner() as runner:
+        runner.Start()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
@@ -299,22 +357,24 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     # But only 8 should have finished.
     self.assertEqual(len(set(finished)), 8)
 
-    # Clean up.
-    foreman.Set(foreman.Schema.RULES())
-    foreman.Close()
-
     self.DeleteClients(10)
 
   def testPausingAndRestartingDoesNotStartHuntTwiceOnTheSameClient(self):
     """This tests if the hunt completes when some clients hang or raise."""
     client_ids = self.SetupClients(10)
 
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_rate=0,
+        token=self.token) as hunt:
+
+      with hunt.GetRunner() as runner:
+        runner.Start()
+
+      hunt_id = hunt.urn
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
@@ -326,17 +386,18 @@ class HuntTest(test_lib.FlowTestsBaseclass):
 
     # Pausing and running hunt: this leads to the fresh rules being written
     # to Foreman.RULES.
-    hunt.Pause()
-    hunt.Run()
+    with aff4.FACTORY.Open(hunt_id, mode="rw", token=self.token) as hunt:
+      with hunt.GetRunner() as runner:
+        runner.Pause()
+        runner.Start()
+
     # Recreating the foreman so that it updates list of rules.
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
       num_tasks = foreman.AssignTasksToClient(client_id)
-      # No tasks should be assigned as this hunt ran of all the clients before.
+      # No tasks should be assigned as this hunt ran on all the clients
+      # before.
       self.assertEqual(num_tasks, 0)
-
-    foreman.Set(foreman.Schema.RULES())
-    foreman.Close()
 
     self.DeleteClients(10)
 
@@ -345,14 +406,15 @@ class HuntTest(test_lib.FlowTestsBaseclass):
 
     # Set up 10 clients.
     client_ids = self.SetupClients(10)
-
-    hunt = hunts.GRRHunt.StartHunt("SampleHunt", token=self.token,
-                                   client_limit=5)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="SampleHunt",
+        client_limit=5,
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_rate=0,
+        token=self.token) as hunt:
+      hunt.Run()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
@@ -362,7 +424,7 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     client_mock = test_lib.SampleHuntMock()
     test_lib.TestHuntHelper(client_mock, client_ids, False, self.token)
 
-    hunt_obj = aff4.FACTORY.Open(hunt.session_id, mode="rw",
+    hunt_obj = aff4.FACTORY.Open(hunt.urn, mode="rw",
                                  age=aff4.ALL_TIMES, token=self.token)
 
     started = hunt_obj.GetValuesForAttribute(hunt_obj.Schema.CLIENTS)
@@ -372,10 +434,6 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     self.assertEqual(len(set(started)), 5)
     self.assertEqual(len(set(finished)), 5)
 
-    # Clean up.
-    foreman.Set(foreman.Schema.RULES())
-    foreman.Close()
-
     self.DeleteClients(10)
 
   def testBrokenHunt(self):
@@ -384,12 +442,16 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     # Set up 10 clients.
     client_ids = self.SetupClients(10)
 
-    hunt = hunts.GRRHunt.StartHunt("BrokenSampleHunt", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="BrokenSampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_rate=0,
+        token=self.token) as hunt:
+
+      with hunt.GetRunner() as runner:
+        runner.Start()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
@@ -412,37 +474,26 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     # All of the clients that have the file should still finish eventually.
     self.assertEqual(len(set(finished)), 5)
 
-    # Clean up.
-    foreman.Set(foreman.Schema.RULES())
-    foreman.Close()
-
     self.DeleteClients(10)
 
   def testHuntNotifications(self):
     """This tests the Hunt notification event."""
-
-    received_events = []
-
-    class Listener1(flow.EventListener):  # pylint: disable=unused-variable
-      well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:TestHuntDone")
-      EVENTS = ["TestHuntDone"]
-
-      @flow.EventHandler(auth_required=True)
-      def ProcessMessage(self, message=None, event=None):
-        _ = event
-        # Store the results for later inspection.
-        received_events.append(message)
+    TestHuntListener.received_events = []
 
     # Set up 10 clients.
     client_ids = self.SetupClients(10)
 
-    hunt = hunts.GRRHunt.StartHunt(
-        "BrokenSampleHunt", notification_event="TestHuntDone", token=self.token)
-    regex_rule = rdfvalue.ForemanAttributeRegex(
-        attribute_name="GRR client",
-        attribute_regex="GRR")
-    hunt.AddRule([regex_rule])
-    hunt.Run()
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="BrokenSampleHunt",
+        regex_rules=[rdfvalue.ForemanAttributeRegex(
+            attribute_name="GRR client",
+            attribute_regex="GRR")],
+        client_rate=0,
+        notification_event="TestHuntDone",
+        token=self.token) as hunt:
+
+      with hunt.GetRunner() as runner:
+        runner.Start()
 
     foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
     for client_id in client_ids:
@@ -453,13 +504,55 @@ class HuntTest(test_lib.FlowTestsBaseclass):
     test_lib.TestHuntHelper(client_mock, client_ids, check_flow_errors=False,
                             token=self.token)
 
-    self.assertEqual(len(received_events), 5)
-
-    # Clean up.
-    foreman.Set(foreman.Schema.RULES())
-    foreman.Close()
+    self.assertEqual(len(TestHuntListener.received_events), 5)
 
     self.DeleteClients(10)
+
+  def testHuntClientRate(self):
+    """Check that clients are scheduled slowly by the hunt."""
+    start_time = 10
+
+    # Set up 10 clients.
+    client_ids = self.SetupClients(10)
+
+    with test_lib.Stubber(time, "time", lambda: start_time):
+      with hunts.GRRHunt.StartHunt(
+          hunt_name="DummyHunt",
+          regex_rules=[
+              rdfvalue.ForemanAttributeRegex(attribute_name="GRR client",
+                                             attribute_regex="GRR"),
+              ],
+          client_rate=1, token=self.token) as hunt:
+        hunt.Run()
+
+      # Pretend to be the foreman now and dish out hunting jobs to all the
+      # clients..
+      foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
+      for client_id in client_ids:
+        foreman.AssignTasksToClient(client_id)
+
+      self.assertEqual(len(DummyHunt.client_ids), 0)
+
+      # Run the hunt.
+      worker_mock = test_lib.MockWorker(check_flow_errors=True,
+                                        token=self.token)
+
+      time.time = lambda: start_time + 2
+
+      # One client is scheduled in the first minute.
+      worker_mock.Simulate()
+      self.assertEqual(len(DummyHunt.client_ids), 1)
+
+      # No further clients will be scheduled until the end of the first minute.
+      time.time = lambda: start_time + 59
+      worker_mock.Simulate()
+      self.assertEqual(len(DummyHunt.client_ids), 1)
+
+      # One client will be processed every minute.
+      for i in range(len(client_ids)):
+        time.time = lambda: start_time + 1 + 60 * i
+        worker_mock.Simulate()
+        self.assertEqual(len(DummyHunt.client_ids), i + 1)
 
 
 class FlowTestLoader(test_lib.GRRTestLoader):

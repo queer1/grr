@@ -7,22 +7,14 @@ AccessControlManager Classes:
   NullAccessControlManager: Gives everyone full access to everything.
   TestAccessControlManager: In memory, very basic functionality for tests.
   FullAccessControlManager: Provides for multiparty authorization.
-  BasicAccessControlManager: Provides basic Admin/Non-Admin funcionality.
-
-UserManager Classes:
-  DatastoreUserManager: Labels are managed inside aff4:/users/<user>/labels
-    inside the datstore.
-  ConfigBasedUserManager: Users and labels are managed in the User section of
-    the config file.
+  BasicAccessControlManager: Provides basic Admin/Non-Admin distinction based on
+    labels.
 """
 
 
-import crypt
 import fnmatch
 import logging
-import random
 import re
-import string
 
 from grr.lib import access_control
 from grr.lib import aff4
@@ -35,171 +27,26 @@ from grr.lib import utils
 from grr.lib.aff4_objects import aff4_grr
 
 
-class DataStoreUserManager(access_control.BaseUserManager):
-  """DataStore based user manager.
+class BaseAccessControlManager(access_control.AccessControlManager):
 
-  This only implements the bare minimum to support the datastore labels. It is
-  assumed that the actual users are managed outside of this mechanism.
+  def CheckUserLabels(self, username, authorized_labels, token=None):
+    """Verify that the username has all the authorized_labels set."""
+    authorized_labels = set(authorized_labels)
 
-  Storage is done via the LABELS attribute of the GRRUser object at:
-    aff4:/users/<username>/labels
-  """
-
-  def __init__(self, *args, **kwargs):
-    super(DataStoreUserManager, self).__init__(*args, **kwargs)
-    self.user_label_cache = utils.AgeBasedCache(
-        max_size=1000, max_age=config_lib.CONFIG["ACL.cache_age"])
-    self.super_token = access_control.ACLToken()
-    self.super_token.supervisor = True
-
-  def GetUserLabels(self, username):
-    """Verify that the username has the authorized_labels set.
-
-    Args:
-       username: The name of the user.
-
-    Returns:
-      True if the user has one of the authorized_labels set.
-    """
     try:
-      # Labels are kept at a different location than the main user object so the
-      # user can not modify them themselves.
-      label_urn = rdfvalue.RDFURN("aff4:/users/").Add(username).Add("labels")
-      labels = self.user_label_cache.Get(label_urn)
-    except KeyError:
-      fd = aff4.FACTORY.Open(label_urn, mode="r", token=self.super_token)
-      labels = fd.Get(fd.Schema.LABEL, [])
+      user = aff4.FACTORY.Open("aff4:/users/%s" % username, aff4_type="GRRUser",
+                               token=token)
 
-      # Cache labels for a short time.
-      if labels:
-        self.user_label_cache.Put(label_urn, labels)
-    return labels
-
-  def SetUserLabels(self, username, labels):
-    """Overwrite the current set of labels with a list of labels.
-
-    Args:
-      username: User to add the labels to.
-      labels: List of additional labels to add to the user.
-    """
-    labels = set(l.lower() for l in labels)
-    label_urn = rdfvalue.RDFURN("aff4:/users/").Add(username).Add("labels")
-    u = aff4.FACTORY.Open(label_urn, mode="rw", token=self.super_token)
-    label_obj = u.Schema.LABEL()
-    for label in labels:
-      label_obj.Append(label)
-    u.Set(label_obj)
-    u.Close()
-    self.user_label_cache.Put(label_urn, labels)
+      # Only return True if all the authorized_labels are found in the user's
+      # label list.
+      return (authorized_labels.intersection(user.GetLabels()) ==
+              authorized_labels)
+    except IOError:
+      return False
 
 
-class ConfigBasedUserManager(access_control.BaseUserManager):
-  """User manager that uses the Users.authentication entry of the config file.
-
-  This reads all user labels out of the configuration file which are in the
-  Users.authentication entry. Each user has a set of labels associated with it.
-
-  e.g.
-  Users.authentication = |
-    admin:GfiE1JZd9GJVs:admin,label2
-    joe:Up9jbksBgt/W.:label1,label2
-
-  """
-
-  def __init__(self, *args, **kwargs):
-    super(ConfigBasedUserManager, self).__init__(*args, **kwargs)
-    self.UpdateCache()
-
-  def UpdateCache(self):
-    self._user_cache = self.ReadUsersFromConfig()
-
-  def ReadUsersFromConfig(self):
-    """Return the users from the config file as a dict."""
-    results = {}
-    users = config_lib.CONFIG.Get("Users.authentication", default="")
-    entries = [user for user in users.split("\n") if user]
-    for entry in entries:
-      try:
-        username, hash_val, labels = entry.split(":")
-      except ValueError:
-        username, hash_val = entry.rstrip(":").split(":")
-        labels = ""
-      labels = [l.strip().lower() for l in labels.strip().split(",")]
-      results[username] = {"hash": hash_val, "labels": labels}
-    return results
-
-  def CheckUserAuth(self, username, auth_obj):
-    """Check a hash against the user database."""
-    crypt_hash = self._user_cache[username]["hash"]
-    salt = crypt_hash[:2]
-    return crypt.crypt(auth_obj.user_provided_hash, salt) == crypt_hash
-
-  def FlushCache(self):
-    user_strings = []
-    for user in self._user_cache:
-      hash_str = self._user_cache[user]["hash"]
-      labels = ",".join(self._user_cache[user]["labels"])
-      user_strings.append("%s:%s:%s" % (user, hash_str, labels))
-
-    config_lib.CONFIG.Set("Users.authentication", "\n".join(user_strings))
-    config_lib.CONFIG.Write()
-
-  def AddUser(self, username, password=None, admin=True, labels=None):
-    """Add a user.
-
-    Args:
-      username: User name to create.
-      password: Password to set.
-      admin: Should the user be made an admin.
-      labels: List of additional labels to add to the user.
-
-    Raises:
-      RuntimeError: On invalid arguments.
-    """
-    self.UpdateCache()
-
-    pwhash = None
-    if password:
-      # Note: As of python 3.3. there is a function to do this, but we do our
-      # own for backwards compatibility.
-      valid_salt_chars = string.ascii_letters + string.digits + "./"
-      salt = "".join(random.choice(valid_salt_chars) for i in range(2))
-      pwhash = crypt.crypt(password, salt)
-    elif username not in self._user_cache:
-      raise RuntimeError("Can't create user without password")
-
-    if labels or admin:
-      # Labels will be added to config. On load of the Users section when the
-      # Admin UI starts, these labels will be set on the users.
-      labels = set(labels or [])
-      if admin:
-        labels.add("admin")
-      labels = sorted(list(labels))
-
-    user_dict = self._user_cache.setdefault(username, {})
-    if pwhash:
-      user_dict["hash"] = pwhash
-    if labels:
-      user_dict["labels"] = labels
-    self.FlushCache()
-
-  def GetUserLabels(self, username):
-    """Get a list of labels for a user."""
-    try:
-      labels = self._user_cache[username]["labels"]
-      return labels
-    except KeyError:
-      raise access_control.InvalidUserError("No such user %s" % username)
-
-  def SetRaw(self, username, hash_str, labels):
-    d = self._user_cache.setdefault(username, {})
-    d["hash"] = hash_str
-    d["labels"] = labels
-
-
-class BasicAccessControlManager(access_control.BaseAccessControlManager):
+class BasicAccessControlManager(BaseAccessControlManager):
   """Basic ACL manager that uses the config file for user management."""
-  user_manager_cls = ConfigBasedUserManager
 
   # pylint: disable=unused-argument
   def CheckHuntAccess(self, token, hunt_urn):
@@ -220,25 +67,11 @@ class BasicAccessControlManager(access_control.BaseAccessControlManager):
   # pylint: enable=unused-argument
 
 
-class NullAccessControlManager(access_control.BaseAccessControlManager):
+class NullAccessControlManager(BasicAccessControlManager):
   """An ACL manager which does not enforce any ACLs."""
 
-  user_manager_cls = DataStoreUserManager
-
   # pylint: disable=unused-argument
-  def CheckHuntAccess(self, token, hunt_urn):
-    """Allow all access."""
-    return True
-
-  def CheckFlowAccess(self, token, flow_name, client_id=None):
-    """Allow all access."""
-    return True
-
-  def CheckDataStoreAccess(self, token, subjects, requested_access="r"):
-    """Allow all access."""
-    return True
-
-  def CheckUserLabels(self, username, authorized_labels):
+  def CheckUserLabels(self, username, authorized_labels, token=None):
     """Allow all access."""
     return True
   # pylint: enable=unused-argument
@@ -313,7 +146,7 @@ class CheckAccessHelper(object):
     subject_str = subject.SerializeToString()
 
     for check_tuple in self.checks:
-      _, regex, require, require_args, require_kwargs = check_tuple
+      regex_text, regex, require, require_args, require_kwargs = check_tuple
 
       match = regex.match(subject_str)
       if not match:
@@ -326,8 +159,8 @@ class CheckAccessHelper(object):
       logging.debug("Allowing access to %s by pattern: %s "
                     "(require=%s, require_args=%s, require_kwargs=%s, "
                     "helper_name=%s)",
-                    subject_str, regex, require, require_args, require_kwargs,
-                    self.helper_name)
+                    subject_str, regex_text, require, require_args,
+                    require_kwargs, self.helper_name)
       return True
 
     logging.debug("Rejecting access to %s (no matched rules)", subject_str)
@@ -335,7 +168,7 @@ class CheckAccessHelper(object):
         "Access to %s rejected: (no matched rules)." % subject, subject=subject)
 
 
-class FullAccessControlManager(access_control.BaseAccessControlManager):
+class FullAccessControlManager(BaseAccessControlManager):
   """An access control manager that handles multi-party authorization.
 
   Write access to the data store is forbidden. Data store read- and query-access
@@ -343,8 +176,6 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
   functions. Please refer to these functions to review or modify GRR's data
   store access policies.
   """
-
-  user_manager_cls = DataStoreUserManager
 
   CLIENT_URN_PATTERN = "aff4:/C." + "[0-9a-fA-F]" * 16
 
@@ -354,13 +185,29 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
         max_size=10000, max_age=config_lib.CONFIG["ACL.cache_age"])
 
     self.flow_cache = utils.FastStore(max_size=10000)
-    self.super_token = access_control.ACLToken()
-    self.super_token.supervisor = True
+    self.super_token = access_control.ACLToken(username="test").SetUID()
 
+    self.write_access_helper = self._CreateWriteAccessHelper()
     self.read_access_helper = self._CreateReadAccessHelper()
     self.query_access_helper = self._CreateQueryAccessHelper()
 
     super(FullAccessControlManager, self).__init__()
+
+  def _CreateWriteAccessHelper(self):
+    """Creates a CheckAccessHelper for controlling write access."""
+    h = CheckAccessHelper("write")
+
+    # Namespace for temporary scratch space. Note that Querying this area is not
+    # allowed. Users should create files with random names if they want to
+    # prevent other users from reading or modifying them.
+    h.Allow("aff4:/tmp")
+    h.Allow("aff4:/tmp/*")
+
+    # Users are allowed to modify artifacts live.
+    h.Allow("aff4:/artifact_store")
+    h.Allow("aff4:/artifact_store/*")
+
+    return h
 
   def _CreateReadAccessHelper(self):
     """Creates a CheckAccessHelper for controlling read access.
@@ -397,6 +244,13 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
     h.Allow("aff4:/FP")
     h.Allow("aff4:/FP/*")
 
+    # The files namespace contains hash references to all files downloaded with
+    # GRR, and is extensible via Filestore objects. Users can access files for
+    # which they know the hash.
+    # See lib/aff4_objects/filestore.py
+    h.Allow("aff4:/files")
+    h.Allow("aff4:/files/*")
+
     # Namespace for indexes. Client index is stored there.
     h.Allow("aff4:/index")
     h.Allow("aff4:/index/*")
@@ -409,6 +263,8 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
     # object is stored there.
     h.Allow("aff4:/stats")
     h.Allow("aff4:/stats/*")
+    h.Allow("aff4:/stats/FileStoreStats")
+    h.Allow("aff4:/stats/FileStoreStats/*")
 
     # Configuration namespace used for reading drivers, python hacks etc.
     h.Allow("aff4:/config")
@@ -431,9 +287,23 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
     h.Allow("aff4:/crashes")
     h.Allow("aff4:/crashes/*")
 
+    # Namespace for audit data.
+    h.Allow("aff4:/audit")
+    h.Allow("aff4:/audit/*")
+
     # Namespace for clients.
     h.Allow(self.CLIENT_URN_PATTERN)
     h.Allow(self.CLIENT_URN_PATTERN + "/*", self.UserHasClientApproval)
+
+    # Namespace for temporary scratch space. Note that Querying this area is not
+    # allowed. Users should create files with random names if they want to
+    # prevent other users from reading or modifying them.
+    h.Allow("aff4:/tmp")
+    h.Allow("aff4:/tmp/*")
+
+    # Allow everyone to read the artifact store.
+    h.Allow("aff4:/artifact_store")
+    h.Allow("aff4:/artifact_store/*")
 
     return h
 
@@ -490,6 +360,10 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
     #       anything under aff4:/flows/W:SOMEFLOW, for example.
     h.Allow("aff4:/flows/*")
 
+    # Querying the index of filestore objects is allowed since it reveals the
+    # clients which have this file.
+    h.Allow("aff4:/files/hash/generic/sha256/" + "[a-z0-9]" * 64)
+
     return h
 
   def RejectWriteAccess(self, unused_subject, unused_token):
@@ -528,7 +402,7 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
     if token.supervisor:
       return True
 
-    flow_cls = flow.GRRFlow.NewPlugin(flow_name)
+    flow_cls = flow.GRRFlow.GetPlugin(flow_name)
 
     # Flows which are not enforced can run all the time.
     if not flow_cls.ACL_ENFORCED:
@@ -556,7 +430,6 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
       access_control.UnauthorizedAccess if access is rejected.
     """
     logging.debug("Checking approval for hunt %s, %s", hunt_urn, token)
-
     if token.supervisor:
       return True
 
@@ -682,7 +555,7 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
 
     # Direct writes are not allowed. Specialised flows (with ACL_ENFORCED=False)
     # have to be used instead.
-    access_checkers = {"w": self.RejectWriteAccess,
+    access_checkers = {"w": self.write_access_helper.CheckAccess,
                        "r": self.read_access_helper.CheckAccess,
                        "q": self.query_access_helper.CheckAccess}
 
@@ -705,7 +578,7 @@ class FullAccessControlManager(access_control.BaseAccessControlManager):
 
   def UserHasAdminLabel(self, subject, token):
     """Checks whether a user has admin label. Used by CheckAccessHelper."""
-    if not self.CheckUserLabels(token.username, ["admin"]):
+    if not self.CheckUserLabels(token.username, ["admin"], token=token):
       raise access_control.UnauthorizedAccess("User has to have 'admin' label.",
                                               subject=subject)
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Setup configuration for the python grr modules."""
 
 # pylint: disable=unused-variable
@@ -142,6 +141,11 @@ grr_test_data_files_spec = ('grr.test_data',
                             [''],
                             ['*'])
 
+grr_docs_files_spec = ('grr',
+                       ['docs'],
+                       ['*'])
+
+
 setup(name='grr',
       version='0.2',
       description='GRR Rapid Response Framework',
@@ -155,12 +159,17 @@ setup(name='grr',
                                      grr_gui_data_files_spec,
                                      grr_client_data_files_spec,
                                      grr_test_data_files_spec,
-                                     grr_config_files_spec]),
+                                     grr_config_files_spec,
+                                     grr_docs_files_spec]),
       entry_points={
           'console_scripts': [
-              'grr_console = grr.tools.console:ConsoleMain',
-              'grr_config_updater = grr.tools.config_updater:ConsoleMain',
-              'grr_server = grr.tools.grr_server:ConsoleMain',
-              'grr_file_exporter = grr.tools.file_exporter:ConsoleMain',
+              'grr_console = grr.lib.distro_entry:Console',
+              'grr_config_updater = grr.lib.distro_entry:ConfigUpdater',
+              'grr_server = grr.lib.distro_entry:GrrServer',
+              'grr_export = grr.lib.distro_entry:Export',
+              'grr_client = grr.lib.distro_entry:Client',
+              'grr_worker = grr.lib.distro_entry:Worker',
+              'grr_enroller = grr.lib.distro_entry:Enroller',
+              'grr_admin_ui = grr.lib.distro_entry:AdminUI',
           ]
       })

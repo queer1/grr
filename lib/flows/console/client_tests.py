@@ -5,6 +5,8 @@
 
 import os
 import re
+import socket
+import threading
 import unittest
 
 
@@ -19,6 +21,7 @@ from grr.lib import registry
 from grr.lib import test_lib
 from grr.lib import utils
 from grr.lib.flows.console import debugging
+from grr.lib.rdfvalues import crypto
 
 
 def TestFlows(client_id, platform, testname=None, local_worker=False):
@@ -30,11 +33,25 @@ def TestFlows(client_id, platform, testname=None, local_worker=False):
   # This token is not really used since there is no approval for the
   # tested client - these tests are designed for raw access - but we send it
   # anyways to have an access reason.
-  token = access_control.ACLToken("test", "client testing")
+  token = access_control.ACLToken(username="test", reason="client testing")
 
   client_id = rdfvalue.RDFURN(client_id)
   RunTests(client_id, platform=platform, testname=testname,
            token=token, local_worker=local_worker)
+
+
+def RecursiveListChildren(prefix=None, token=None):
+  all_urns = set()
+  act_urns = set([prefix])
+
+  while act_urns:
+    next_urns = set()
+    for _, children in aff4.FACTORY.MultiListChildren(act_urns, token=token):
+      for urn in children:
+        next_urns.add(urn)
+    all_urns |= next_urns
+    act_urns = next_urns
+  return all_urns
 
 
 class ClientTestBase(test_lib.GRRBaseTest):
@@ -68,13 +85,15 @@ class ClientTestBase(test_lib.GRRBaseTest):
 
   def runTest(self):
     if self.local_worker:
-      self.flow_obj = debugging.StartFlowAndWorker(
+      flow_obj = debugging.StartFlowAndWorker(
           self.client_id, self.flow, cpu_limit=self.cpu_limit,
           network_bytes_limit=self.network_bytes_limit, **self.args)
+      self.flow_urn = flow_obj.urn
     else:
-      self.flow_obj = debugging.StartFlowAndWait(
+      flow_obj = debugging.StartFlowAndWait(
           self.client_id, self.flow, cpu_limit=self.cpu_limit,
           network_bytes_limit=self.network_bytes_limit, **self.args)
+      self.flow_urn = flow_obj.urn
 
     self.CheckFlow()
 
@@ -130,17 +149,15 @@ class TestGetFileTSKLinux(ClientTestBase):
   def CheckFlow(self):
     pos = self.output_path.find("*")
     if pos > 0:
-      urn = self.client_id.Add(self.output_path[:pos])
-      for entry in data_store.DB.Query(subject_prefix=urn):
-        subject = entry["subject"][0][0]
-        if re.search(self.output_path + "$", subject):
-          urn = subject
-          self.to_delete = rdfvalue.RDFURN(urn)
+      prefix = self.client_id.Add(self.output_path[:pos])
+      for urn in RecursiveListChildren(prefix=prefix):
+        if re.search(self.output_path + "$", str(urn)):
+          self.to_delete = urn
           return self.CheckFile(aff4.FACTORY.Open(urn))
     else:
       urn = self.client_id.Add(self.output_path)
       fd = aff4.FACTORY.Open(urn)
-      if isinstance(fd, aff4.HashImage):
+      if isinstance(fd, aff4.BlobImage):
         return self.CheckFile(fd)
 
     self.fail("Output file not found.")
@@ -177,6 +194,64 @@ class TestGetFileOSLinux(TestGetFileTSKLinux):
   output_path = "/fs/os/bin/ls"
 
 
+class TestSendFile(ClientTestBase):
+  platforms = ["linux"]
+  flow = "SendFile"
+  key = rdfvalue.AES128Key("1a5eafcc77d428863d4c2441ea26e5a5")
+  iv = rdfvalue.AES128Key("2241b14c64874b1898dad4de7173d8c0")
+
+  args = dict(host="127.0.0.1",
+              port=12345,
+              pathspec=rdfvalue.PathSpec(pathtype=0, path="/bin/ls"),
+              key=key,
+              iv=iv)
+
+  def setUp(self):
+
+    logging.info("This test only works if the client is running on localhost!!")
+
+    class Listener(threading.Thread):
+      result = []
+      daemon = True
+
+      def run(self):
+        for res in socket.getaddrinfo(
+            None, 12345, socket.AF_INET,
+            socket.SOCK_STREAM, 0, socket.AI_ADDRCONFIG):
+          af, socktype, proto, _, sa = res
+          try:
+            s = socket.socket(af, socktype, proto)
+          except socket.error:
+            s = None
+            continue
+          try:
+            s.bind(sa)
+            s.listen(1)
+          except socket.error:
+            s.close()
+            s = None
+            continue
+          break
+        conn, _ = s.accept()
+        while 1:
+          data = conn.recv(1024)
+          if not data: break
+          self.result.append(data)
+        conn.close()
+
+    self.listener = Listener()
+    self.listener.start()
+
+  def CheckFlow(self):
+    original_data = open("/bin/ls", "rb").read()
+    received_cipher = "".join(self.listener.result)
+    cipher = crypto.AES128CBCCipher(key=self.key, iv=self.iv,
+                                    mode=crypto.AES128CBCCipher.OP_DECRYPT)
+    received_data = cipher.Update(received_cipher) + cipher.Final()
+
+    self.assertEqual(received_data, original_data)
+
+
 class TestListDirectoryOSLinux(ClientTestBase):
   """Tests if ListDirectory works on Linux."""
   platforms = ["linux", "darwin"]
@@ -193,10 +268,8 @@ class TestListDirectoryOSLinux(ClientTestBase):
     urn = None
     if pos > 0:
       base_urn = self.client_id.Add(self.output_path[:pos])
-      for entry in data_store.DB.Query(subject_prefix=base_urn):
-        subject = entry["subject"][0][0]
-        if re.search(self.output_path + "$", subject):
-          urn = rdfvalue.RDFURN(subject)
+      for urn in RecursiveListChildren(prefix=base_urn):
+        if re.search(self.output_path + "$", str(urn)):
           self.to_delete = urn
           break
       self.assertNotEqual(urn, None, "Could not locate Directory.")
@@ -231,9 +304,10 @@ class TestFindTSKLinux(TestListDirectoryTSKLinux):
   """Tests if the find flow works on Linux using Sleuthkit."""
   flow = "FindFiles"
 
-  args = {"findspec": rdfvalue.RDFFindSpec(
+  args = {"findspec": rdfvalue.FindSpec(
+      path_regex=".",
       pathspec=rdfvalue.PathSpec(
-          path="/bin",
+          path="/bin/",
           pathtype=rdfvalue.PathSpec.PathType.TSK))}
 
 
@@ -241,13 +315,14 @@ class TestFindOSLinux(TestListDirectoryOSLinux):
   """Tests if the find flow works on Linux."""
   flow = "FindFiles"
 
-  args = {"findspec": rdfvalue.RDFFindSpec(
+  args = {"findspec": rdfvalue.FindSpec(
+      path_regex=".",
       pathspec=rdfvalue.PathSpec(
-          path="/bin",
+          path="/bin/",
           pathtype=rdfvalue.PathSpec.PathType.OS))}
 
 
-class TestInterrogate(ClientTestBase):
+class TestClientInterrogateEndToEnd(ClientTestBase):
   """Tests the Interrogate flow on windows."""
   platforms = ["windows", "linux", "darwin"]
   flow = "Interrogate"
@@ -262,7 +337,7 @@ class TestInterrogate(ClientTestBase):
                 aff4.VFSGRRClient.SchemaCls.USERNAMES]
 
   def setUp(self):
-    super(TestInterrogate, self).setUp()
+    super(TestClientInterrogateEndToEnd, self).setUp()
     data_store.DB.DeleteAttributes(self.client_id, [
         str(attribute) for attribute in self.attributes], sync=True)
     aff4.FACTORY.Flush()
@@ -297,12 +372,12 @@ class TestListDirectoryTSKWindows(TestListDirectoryTSKLinux):
   file_to_find = "regedit.exe"
 
   def CheckFlow(self):
+    found = False
     # XP has uppercase...
     for windir in ["Windows", "WINDOWS"]:
       urn = self.client_id.Add("/fs/tsk")
       fd = aff4.FACTORY.Open(urn, mode="r", token=self.token)
       volumes = list(fd.OpenChildren())
-      found = False
       for volume in volumes:
         fd = aff4.FACTORY.Open(volume.urn.Add(windir), mode="r",
                                token=self.token)
@@ -334,25 +409,34 @@ class TestFindWindowsRegistry(ClientTestBase):
   """
   platforms = ["windows"]
   reg_path = ("/HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows NT/"
-              "CurrentVersion/ProfileList")
+              "CurrentVersion/ProfileList/")
 
   output_path = "analysis/find/test"
 
   def runTest(self):
     """Launch our flows."""
-    debugging.StartFlowAndWait(self.client_id, "ListDirectory",
-                               pathspec=rdfvalue.PathSpec(
-                                   pathtype=rdfvalue.PathSpec.PathType.REGISTRY,
-                                   path=self.reg_path))
-
-    debugging.StartFlowAndWait(
-        self.client_id, "FindFiles",
-        findspec=rdfvalue.RDFFindSpec(
+    for flow, args in [
+        ("ListDirectory", {"pathspec": rdfvalue.PathSpec(
+            pathtype=rdfvalue.PathSpec.PathType.REGISTRY,
+            path=self.reg_path)}),
+        ("FindFiles", {"findspec": rdfvalue.FindSpec(
             pathspec=rdfvalue.PathSpec(
                 path=self.reg_path,
                 pathtype=rdfvalue.PathSpec.PathType.REGISTRY),
             path_regex="ProfileImagePath"),
-        output=self.output_path)
+                       "output": self.output_path})]:
+
+      if self.local_worker:
+        flow_obj = debugging.StartFlowAndWorker(
+            self.client_id, flow, cpu_limit=self.cpu_limit,
+            network_bytes_limit=self.network_bytes_limit, **args)
+        self.flow_urn = flow_obj.urn
+      else:
+        flow_obj = debugging.StartFlowAndWait(
+            self.client_id, flow, cpu_limit=self.cpu_limit,
+            network_bytes_limit=self.network_bytes_limit, **args)
+
+        self.flow_urn = flow_obj.urn
 
     self.CheckFlow()
 
@@ -366,10 +450,10 @@ class TestFindWindowsRegistry(ClientTestBase):
 
     urn = self.client_id.Add(self.output_path)
     fd = aff4.FACTORY.Open(urn, token=self.token)
-    hits = sorted([x.urn for x in fd.OpenChildren()])
+    hits = sorted([x.aff4path for x in fd])
 
+    self.assertGreater(len(hits), 1)
     self.assertEqual(len(hits), len(user_accounts))
-    self.assertTrue(len(hits) > 1)
 
     for x, y in zip(user_accounts, hits):
       self.assertEqual(x.Add("ProfileImagePath"), y)
@@ -416,7 +500,7 @@ class TestGetFileTSKWindows(TestGetFileOSWindows):
     self.assertTrue(found)
 
 
-class TestRegistry(ClientTestBase):
+class TestClientRegistry(ClientTestBase):
   """Tests if listing registry keys works on Windows."""
   platforms = ["windows"]
   flow = "ListDirectory"
@@ -466,21 +550,26 @@ class TestCPULimit(LocalClientTest):
   cpu_limit = 7
 
   def CheckFlow(self):
-    backtrace = self.flow_obj.state.context.get("backtrace", "")
-    if "BusyHang not available" in backtrace:
-      print "Client does not support this test."
+    # Reopen the object to update the state.
+    flow_obj = aff4.FACTORY.Open(self.flow_urn, token=self.token)
+    backtrace = flow_obj.state.context.get("backtrace", "")
+    if backtrace:
+      if "BusyHang not available" in backtrace:
+        print "Client does not support this test."
+      else:
+        self.assertTrue("CPU limit exceeded." in backtrace)
     else:
-      self.assertTrue("CPU limit exceeded." in backtrace)
+      self.fail("Flow did not raise the proper error.")
 
 
 class TestNetworkFlowLimit(ClientTestBase):
   platforms = ["linux", "darwin"]
   flow = "GetFile"
-  network_bytes_limit = 2 * 1024 * 1024
-  args = {"pathspec": rdfvalue.PathSpec(path="/usr/bin/python",
+  network_bytes_limit = 500 * 1024
+  args = {"pathspec": rdfvalue.PathSpec(path="/bin/bash",
                                         pathtype=rdfvalue.PathSpec.PathType.OS)}
 
-  output_path = "/fs/os/usr/bin/python"
+  output_path = "/fs/os/bin/bash"
 
   def setUp(self):
     self.urn = self.client_id.Add(self.output_path)
@@ -489,42 +578,48 @@ class TestNetworkFlowLimit(ClientTestBase):
     self.assertEqual(type(fd), aff4.AFF4Volume)
 
   def CheckFlow(self):
-    self.assertAlmostEqual(self.flow_obj.state.context.network_bytes_sent,
-                           self.network_bytes_limit, delta=3000)
-    backtrace = self.flow_obj.state.context.get("backtrace", "")
+    # Reopen the object to update the state.
+    flow_obj = aff4.FACTORY.Open(self.flow_urn, token=self.token)
+
+    # Make sure we transferred approximately the right amount of data.
+    self.assertAlmostEqual(flow_obj.state.context.network_bytes_sent,
+                           self.network_bytes_limit, delta=30000)
+    backtrace = flow_obj.state.context.get("backtrace", "")
     self.assertTrue("Network bytes limit exceeded." in backtrace)
 
-    fd = aff4.FACTORY.Open(self.urn, mode="r", token=self.token)
-    self.assertEqual(type(fd), aff4.AFF4Volume)
 
-
-class TestFastGetFileNetworkLimitExceeded(LocalClientTest):
+class TestMultiGetFileNetworkLimitExceeded(LocalClientTest):
   platforms = ["linux", "darwin"]
   flow = "NetworkLimitTestFlow"
   args = {}
   network_bytes_limit = 3 * 512 * 1024
 
   def CheckFlow(self):
-    backtrace = self.flow_obj.state.context.get("backtrace", "")
+    # Reopen the object to update the state.
+    flow_obj = aff4.FACTORY.Open(self.flow_urn, token=self.token)
+    backtrace = flow_obj.state.context.get("backtrace", "")
     self.assertTrue("Network bytes limit exceeded." in backtrace)
 
-    self.output_path = self.flow_obj.state.dest_path.path
+    self.output_path = flow_obj.state.dest_path.path
     self.urn = self.client_id.Add(self.output_path)
 
     fd = aff4.FACTORY.Open(self.urn, mode="r", token=self.token)
     self.assertEqual(type(fd), aff4.AFF4Volume)
 
 
-class TestFastGetFile(LocalClientTest):
+class TestMultiGetFile(LocalClientTest):
   platforms = ["linux", "darwin"]
-  flow = "FastGetFileTestFlow"
+  flow = "MultiGetFileTestFlow"
   args = {}
 
   def CheckFlow(self):
+    # Reopen the object to update the state.
+    flow_obj = aff4.FACTORY.Open(self.flow_urn, token=self.token)
+
     # Check flow completed normally, checking is done inside the flow
-    self.assertEqual(self.flow_obj.state.context.state,
-                     rdfvalue.Flow.State.TERMINATED)
-    self.assertFalse(self.flow_obj.state.context.get("backtrace", ""))
+    self.assertEqual(
+        flow_obj.state.context.state, rdfvalue.Flow.State.TERMINATED)
+    self.assertFalse(flow_obj.state.context.get("backtrace", ""))
 
 
 class TestProcessListing(ClientTestBase):
@@ -532,17 +627,19 @@ class TestProcessListing(ClientTestBase):
 
   flow = "ListProcesses"
 
+  args = {"output": "analysis/ListProcesses/testing"}
+
   def setUp(self):
     super(TestProcessListing, self).setUp()
-    self.process_urn = self.client_id.Add("processes")
+    self.process_urn = self.client_id.Add(self.args["output"])
     self.DeleteUrn(self.process_urn)
 
     self.assertRaises(AssertionError, self.CheckFlow)
 
   def CheckFlow(self):
     procs = aff4.FACTORY.Open(self.process_urn, mode="r", token=self.token)
-    self.assertIsInstance(procs, aff4.ProcessListing)
-    process_list = procs.Get(procs.Schema.PROCESSES)
+    self.assertIsInstance(procs, aff4.RDFValueCollection)
+    process_list = list(procs)
     # Make sure there are at least some results.
     self.assertGreater(len(process_list), 5)
 
@@ -575,7 +672,9 @@ class TestNetstat(ClientTestBase):
     self.assertGreater(len(num_ips), 1)
     # There should be at least two different connection states.
     num_states = set([k.state for k in connections])
-    self.assertGreater(len(num_states), 1)
+    # This is a known issue on CentOS so we just warn about it.
+    if len(num_states) <= 1:
+      logging.warning("Only received one distinct connection state!")
 
 
 class TestGetClientStats(ClientTestBase):
@@ -591,6 +690,7 @@ class TestGetClientStats(ClientTestBase):
     self.assertRaises(AssertionError, self.CheckFlow)
 
   def CheckFlow(self):
+    aff4.FACTORY.Flush()
     client_stats = aff4.FACTORY.Open(self.stats_urn, token=self.token)
     self.assertIsInstance(client_stats, aff4.ClientStats)
 
@@ -604,8 +704,10 @@ class TestGetClientStats(ClientTestBase):
     self.assertGreater(entry.bytes_sent, 0)
     self.assertGreater(entry.memory_percent, 0)
 
-    self.assertGreater(len(list(entry.io_samples)), 0)
     self.assertGreater(len(list(entry.cpu_samples)), 0)
+    if not list(entry.io_samples):
+      logging.warning("No IO samples received. This is ok if the tested"
+                      " client is a mac.")
 
 
 class FingerPrintTestBase(object):
@@ -644,7 +746,8 @@ class TestFingerprintFileOSWindows(FingerPrintTestBase, TestGetFileOSWindows):
 class TestAnalyzeClientMemory(ClientTestBase):
   platforms = ["windows"]
   flow = "AnalyzeClientMemory"
-  args = {"plugins": "pslist",
+  args = {"request": rdfvalue.VolatilityRequest(plugins=["pslist"],
+                                                args={"pslist": {}}),
           "output": "analysis/pslist/testing"}
 
   def setUp(self):
@@ -656,8 +759,9 @@ class TestAnalyzeClientMemory(ClientTestBase):
 
   def CheckFlow(self):
     response = aff4.FACTORY.Open(self.urn, token=self.token)
-    self.assertIsInstance(response, aff4.VolatilityResponse)
-    result = response.Get(response.Schema.RESULT)
+    self.assertIsInstance(response, aff4.RDFValueCollection)
+    self.assertEqual(len(response), 1)
+    result = response[0]
     self.assertEqual(result.error, "")
     self.assertGreater(len(result.sections), 0)
 
@@ -675,16 +779,16 @@ class TestAnalyzeClientMemory(ClientTestBase):
 
 
 class TestGrepMemory(ClientTestBase):
-  platforms = ["windows"]
-  flow = "GrepMemory"
-
-  args = {"output": "analysis/grep/testing",
-          "request": rdfvalue.GrepSpec(
-              literal="grr", length=4*1024*1024*1024,
-              mode=rdfvalue.GrepSpec.Mode.FIRST_HIT,
-              bytes_before=10, bytes_after=10)}
+  platforms = ["windows", "darwin"]
+  flow = "ScanMemory"
 
   def setUp(self):
+    self.args = {"also_download": False,
+                 "grep": rdfvalue.BareGrepSpec(
+                     literal="grr", length=4*1024*1024*1024,
+                     mode=rdfvalue.GrepSpec.Mode.FIRST_HIT,
+                     bytes_before=10, bytes_after=10),
+                 "output": "analysis/grep/testing",}
     super(TestGrepMemory, self).setUp()
     self.urn = self.client_id.Add(self.args["output"])
     self.DeleteUrn(self.urn)
@@ -692,7 +796,7 @@ class TestGrepMemory(ClientTestBase):
 
   def CheckFlow(self):
     collection = aff4.FACTORY.Open(self.urn, token=self.token)
-    self.assertIsInstance(collection, aff4.GrepResultsCollection)
+    self.assertIsInstance(collection, aff4.RDFValueCollection)
     self.assertEqual(len(list(collection)), 1)
     reference = collection[0]
 
@@ -740,9 +844,63 @@ class TestLaunchBinaries(ClientTestBase):
 
   def CheckFlow(self):
     # Check that the test binary returned the correct stdout:
-    fd = aff4.FACTORY.Open(self.flow_obj.urn, age=aff4.ALL_TIMES,
+    fd = aff4.FACTORY.Open(self.flow_urn, age=aff4.ALL_TIMES,
                            token=self.token)
     logs = "\n".join(
         [str(x) for x in fd.GetValuesForAttribute(fd.Schema.LOG)])
 
     self.assertTrue("Hello world" in logs)
+
+
+class TestCollector(ClientTestBase):
+  platforms = ["windows"]
+  flow = "ArtifactCollectorFlow"
+
+  args = {"output": "analysis/artifact/testing",
+          "artifact_list": ["VolatilityPsList"],
+          "store_results_in_aff4": False}
+
+  def setUp(self):
+    super(TestCollector, self).setUp()
+    self.urn = self.client_id.Add(self.args["output"])
+    self.DeleteUrn(self.urn)
+
+  def CheckFlow(self):
+    collection = aff4.FACTORY.Open(self.urn, token=self.token)
+    self.assertIsInstance(collection, aff4.RDFValueCollection)
+    self.assertTrue(len(list(collection)) > 40)
+
+
+class TestSearchFiles(ClientTestBase):
+  platforms = ["linux"]
+  flow = "SearchFileContent"
+
+  args = {"output": "analysis/SearchFiles/testing",
+          "paths": ["/bin/ls*"],
+          "also_download": True}
+
+  def setUp(self):
+    super(TestSearchFiles, self).setUp()
+    self.urn = self.client_id.Add(self.args["output"])
+    self.DeleteUrn(self.urn)
+    self.assertRaises(Exception, self.CheckFlow)
+
+  def CheckFlow(self):
+    results = aff4.FACTORY.Open(self.urn, token=self.token)
+    self.assertGreater(len(results), 1)
+    for result in results:
+      self.assertTrue(result.pathspec.path.startswith("/bin/ls"))
+
+
+class TestSearchFilesGrep(TestSearchFiles):
+  args = {"output": "analysis/SearchFilesGrep/testing",
+          "paths": ["/bin/ls*"],
+          "grep": rdfvalue.BareGrepSpec(literal="ELF"),
+          "also_download": True}
+
+  def CheckFlow(self):
+    results = aff4.FACTORY.Open(self.urn, token=self.token)
+    self.assertGreater(len(results), 1)
+    for result in results:
+      self.assertTrue("ELF" in result.data)
+      self.assertTrue("ls" in result.pathspec.path)

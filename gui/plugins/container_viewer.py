@@ -12,6 +12,7 @@ import logging
 
 from grr.gui import renderers
 from grr.gui.plugins import fileview
+from grr.gui.plugins import semantic
 from grr.lib import aff4
 from grr.lib import rdfvalue
 from grr.lib import utils
@@ -20,7 +21,7 @@ from grr.lib import utils
 locale.setlocale(locale.LC_ALL, "")
 
 
-class RDFValueCollectionViewRenderer(renderers.RDFValueRenderer):
+class RDFValueCollectionViewRenderer(semantic.RDFValueArrayRenderer):
   """Render an RDFView."""
   classname = "RDFValueCollectionView"
   name = "Array"
@@ -112,9 +113,9 @@ class ContainerFileTable(renderers.TableRenderer):
 
     super(ContainerFileTable, self).__init__(**kwargs)
 
-    self.AddColumn(renderers.RDFValueColumn(
-        "Icon", renderer=renderers.IconRenderer, width="40px"))
-    self.AddColumn(renderers.AttributeColumn("subject", width="100%"))
+    self.AddColumn(semantic.RDFValueColumn(
+        "Icon", renderer=semantic.IconRenderer, width="40px"))
+    self.AddColumn(semantic.AttributeColumn("subject", width="100%"))
 
   def Layout(self, request, response):
     """The table lists files in the directory and allow file selection."""
@@ -131,7 +132,7 @@ class ContainerFileTable(renderers.TableRenderer):
     view = container.Get(container.Schema.VIEW, [])
     for column_name in view:
       try:
-        self.AddColumn(renderers.AttributeColumn(column_name))
+        self.AddColumn(semantic.AttributeColumn(column_name))
       except (KeyError, AttributeError):
         logging.error("Container %s specifies an invalid attribute %s",
                       container.urn, column_name)
@@ -156,9 +157,10 @@ class ContainerFileTable(renderers.TableRenderer):
     try:
       children = self.content_cache.Get(key)
     except KeyError:
-      children = dict(((utils.SmartUnicode(c.urn), c)
-                       for c in container.Query(query_expression,
-                                                limit=limit)))
+      children = {}
+      for c in sorted(container.Query(query_expression, limit=limit)):
+        children[utils.SmartUnicode(c.urn)] = c
+
       self.content_cache.Put(key, children)
 
     child_names = children.keys()
@@ -275,7 +277,8 @@ class ContainerToolbar(renderers.TemplateRenderer):
    METHOD=post target='_blank'>
 <input type="hidden" name='container' value='{{this.container|escape}}' />
 <input type="hidden" id="csv_query" name="query" />
-{% csrf_token %}
+<input type="hidden" id="csv_reason" name="reason" />
+<input type="hidden" id="csrfmiddlewaretoken" name="csrfmiddlewaretoken" />
 <button id='export' title="Export to CSV" class="btn">
 <img src="/static/images/stock-save.png" class="toolbar_icon" />
 </button>
@@ -285,7 +288,7 @@ class ContainerToolbar(renderers.TemplateRenderer):
 {{this.container|escape}}
 </li>
 
-<li class="pull-right">
+<li class="toolbar-search-box">
 <form id="form_{{unique|escape}}" name="query_form" class="form-search">
 <div class="input-append">
 
@@ -297,7 +300,9 @@ class ContainerToolbar(renderers.TemplateRenderer):
 </li>
 <script>
 $('#export').button().click(function () {
+  $("input#csrfmiddlewaretoken").val(grr.getCookie("csrftoken"));
   $("input#csv_query").val($("input#query").val());
+  $("input#csv_reason").val(grr.state.reason);
   $("#csv_{{unique|escape}}").submit();
 });
 

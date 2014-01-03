@@ -59,6 +59,9 @@ flags.DEFINE_string("client", None,
                     "Initialise the console with this client id "
                     "(e.g. C.1234345).")
 
+flags.DEFINE_string("reason", None,
+                    "Create a default token with this access reason ")
+
 flags.DEFINE_string("code_to_execute", None,
                     "If present, no console is started but the code given in "
                     "the flag is run instead (comparable to the -c option of "
@@ -78,7 +81,8 @@ def SearchClients(query_str, token=None, limit=1000):
   """Search indexes for clients. Returns list (client, hostname, os version)."""
   client_schema = aff4.AFF4Object.classes["VFSGRRClient"].SchemaCls
   results = []
-  result_set = search.SearchClients(query_str, max_results=limit, token=token)
+  result_urns = search.SearchClients(query_str, max_results=limit, token=token)
+  result_set = aff4.FACTORY.MultiOpen(result_urns, token=token)
   for result in result_set:
     results.append((result,
                     str(result.Get(client_schema.HOSTNAME)),
@@ -138,7 +142,8 @@ def GetNotifications(user=None, token=None):
 
 def ApprovalRequest(client_id, reason, approvers, token=None):
   """Request approval to access a host."""
-  return flow.GRRFlow.StartFlow(client_id, "RequestClientApprovalFlow",
+  return flow.GRRFlow.StartFlow(client_id=client_id,
+                                flow_name="RequestClientApprovalFlow",
                                 reason=reason, approver=approvers, token=token)
 
 
@@ -153,7 +158,8 @@ def ApprovalGrant(token=None):
     print request
     print "Reason: %s" % reason
     if raw_input("Do you approve this request? [y/N] ").lower() == "y":
-      flow_id = flow.GRRFlow.StartFlow(client_id, "GrantClientApprovalFlow",
+      flow_id = flow.GRRFlow.StartFlow(client_id=client_id,
+                                       flow_name="GrantClientApprovalFlow",
                                        reason=reason, delegate=user,
                                        token=token)
       # TODO(user): Remove the notification.
@@ -165,7 +171,7 @@ def ApprovalGrant(token=None):
 def ApprovalFind(object_id, token=None):
   """Find approvals issued for a specific client."""
   user = getpass.getuser()
-  object_id = aff4.RDFURN(object_id)
+  object_id = rdfvalue.RDFURN(object_id)
   try:
     approved_token = aff4.Approval.GetApprovalForObject(
         object_id, token=token, username=user)
@@ -189,12 +195,13 @@ def ApprovalCreateRaw(client_id, token, approval_type="ClientApproval"):
   Raises:
     RuntimeError: On bad token.
   """
+  client_id = rdfvalue.ClientURN(client_id)
   if not token.reason:
     raise RuntimeError("Cannot create approval with empty reason")
-  approval_urn = aff4.ROOT_URN.Add("ACL").Add(client_id).Add(
+  approval_urn = aff4.ROOT_URN.Add("ACL").Add(client_id.Path()).Add(
       token.username).Add(utils.EncodeReasonString(token.reason))
 
-  super_token = access_control.ACLToken()
+  super_token = access_control.ACLToken(username="test")
   super_token.supervisor = True
 
   approval_request = aff4.FACTORY.Create(approval_urn, approval_type,
@@ -206,7 +213,7 @@ def ApprovalCreateRaw(client_id, token, approval_type="ClientApproval"):
       approval_request.Schema.APPROVER("%s1-raw" % user))
   approval_request.AddAttribute(
       approval_request.Schema.APPROVER("%s-raw2" % user))
-  approval_request.Close()
+  approval_request.Close(sync=True)
 
 
 def ApprovalRevokeRaw(client_id, token, remove_from_cache=False):
@@ -221,10 +228,11 @@ def ApprovalRevokeRaw(client_id, token, remove_from_cache=False):
     remove_from_cache: If True, also remove the approval from the
                        security_manager cache.
   """
-  approval_urn = aff4.ROOT_URN.Add("ACL").Add(client_id).Add(
+  client_id = rdfvalue.ClientURN(client_id)
+  approval_urn = aff4.ROOT_URN.Add("ACL").Add(client_id.Path()).Add(
       token.username).Add(utils.EncodeReasonString(token.reason))
 
-  super_token = access_control.ACLToken()
+  super_token = access_control.ACLToken(username="test")
   super_token.supervisor = True
 
   approval_request = aff4.FACTORY.Open(approval_urn, mode="rw",
@@ -252,7 +260,7 @@ def OpenClient(client_id=None):
     tuple containing (client, token) objects or (None, None) on if
     no appropriate aproval tokens were found.
   """
-  token = access_control.ACLToken()
+  token = access_control.ACLToken(username="test")
   try:
     token = ApprovalFind(client_id, token=token)
   except access_control.UnauthorizedAccess as e:
@@ -280,7 +288,7 @@ def SetLabels(urn, labels, token=None):
 
 def ListDrivers():
   urn = aff4.ROOT_URN.Add(memory.DRIVER_BASE)
-  token = access_control.ACLToken()
+  token = access_control.ACLToken(username="test")
   fd = aff4.FACTORY.Open(urn, mode="r", token=token)
 
   return list(fd.Query())
@@ -302,6 +310,11 @@ def main(unused_argv):
       "Context applied when running the console binary.")
   startup.Init()
 
+  # To make the console easier to use, we make a default token which will be
+  # used in StartFlow operations.
+  data_store.default_token = rdfvalue.ACLToken(username=getpass.getuser(),
+                                               reason=flags.FLAGS.reason)
+
   locals_vars = {
       "hilfe": Help,
       "help": Help,
@@ -322,15 +335,10 @@ def main(unused_argv):
 
   if flags.FLAGS.code_to_execute:
     logging.info("Running code from flag: %s", flags.FLAGS.code_to_execute)
-    exec(flags.FLAGS.code_to_execute)  # pylint: disable=exec-statement
+    exec(flags.FLAGS.code_to_execute)  # pylint: disable=exec-used
   else:
     ipshell.IPShell(argv=[], user_ns=locals_vars, banner=banner)
 
 
-def ConsoleMain():
-  """Helper function for calling with setup tools entry points."""
-  flags.StartMain(main)
-
-
 if __name__ == "__main__":
-  ConsoleMain()
+  flags.StartMain(main)

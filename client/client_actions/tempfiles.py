@@ -19,17 +19,6 @@ from grr.lib import config_lib
 from grr.lib import rdfvalue
 
 
-config_lib.DEFINE_string(
-    name="Client.tempfile_prefix",
-    help="Prefix to use for temp files created by GRR.",
-    default="tmp%(Client.name)")
-
-config_lib.DEFINE_string(
-    name="Client.tempdir",
-    help="Default temporary directory to use on the client.",
-    default="/var/tmp/grr/")
-
-
 class Error(Exception):
   """Base error class."""
 
@@ -97,8 +86,7 @@ def CreateGRRTempFile(directory=None, lifetime=0, suffix=""):
   # Fix perms on the file, since this code is used for writing executable blobs
   # we apply RWX.
   if sys.platform == "win32":
-    client_utils.WinChmod(outfile.name, ["FILE_ALL_ACCESS"],
-                          user="SYSTEM")
+    client_utils.WinChmod(outfile.name, ["FILE_ALL_ACCESS"])
   else:
     os.chmod(outfile.name, stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 

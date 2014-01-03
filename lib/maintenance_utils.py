@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
-
 """This file contains utility classes related to maintenance used by GRR."""
 
 
@@ -17,21 +15,15 @@ from grr.lib import access_control
 from grr.lib import aff4
 from grr.lib import build
 from grr.lib import config_lib
+from grr.lib import data_store
 from grr.lib import rdfvalue
+
 
 DIGEST_ALGORITHM = hashlib.sha256
 DIGEST_ALGORITHM_STR = "sha256"
 
 SUPPORTED_PLATFORMS = ["windows", "linux", "darwin"]
-
-
-config_lib.DEFINE_string("MemoryDriver.driver_service_name",
-                         "Pmem",
-                         "The SCCM service name for the driver.")
-
-config_lib.DEFINE_string("MemoryDriver.driver_display_name",
-                         "%(Client.name) Pmem",
-                         "The SCCM display name for the driver.")
+SUPPORTED_ARCHICTECTURES = ["i386", "amd64"]
 
 
 def UploadSignedConfigBlob(content, aff4_path, client_context=None, token=None):
@@ -71,22 +63,21 @@ def UploadSignedConfigBlob(content, aff4_path, client_context=None, token=None):
   logging.info("Uploaded to %s", fd.urn)
 
 
-def UploadSignedDriverBlob(content, file_name, platform, arch="i386",
-                           aff4_path="/config/drivers/{platform}/memory/"
-                           "{file_name}", install_request=None, token=None):
+def UploadSignedDriverBlob(content, aff4_path=None, client_context=None,
+                           install_request=None, token=None):
   """Upload a signed blob into the datastore.
 
   Args:
     content: Content of the driver file to upload.
-    file_name: Unique name for file to upload.
-    platform: Which client platform to sign for. This determines which signing
-        keys to use. If you don't have per platform signing keys. The standard
-        keys will be used.
-    arch: The architecture of the platform (e.g. i386, amd64).
-    aff4_path: aff4 path to upload to. Note this can handle platform and
-        file_name interpolation.
+
+    aff4_path: aff4 path to upload to. If not specified, we use the config to
+      figure out where it goes.
+
+    client_context: The configuration contexts to use.
+
     install_request: A DriverInstallRequest rdfvalue describing the installation
       parameters for this driver. If None these are read from the config.
+
     token: A security token.
 
   Returns:
@@ -95,46 +86,36 @@ def UploadSignedDriverBlob(content, file_name, platform, arch="i386",
   Raises:
     IOError: On failure to write.
   """
-  # We create a client context to emulate the specific client's
-  # environment. This allows us to configure different values for the same
-  # parameters for different client architectures in the same configuration
-  # file.
-  client_context = ["Platform:%s" % platform.title(),
-                    "Arch:%s" % arch,
-                    "Client"]
   sig_key = config_lib.CONFIG.Get("PrivateKeys.driver_signing_private_key",
                                   context=client_context)
 
   ver_key = config_lib.CONFIG.Get("Client.driver_signing_public_key",
                                   context=client_context)
 
+  if aff4_path is None:
+    aff4_path = config_lib.CONFIG.Get("MemoryDriver.aff4_path",
+                                      context=client_context)
+
   blob_rdf = rdfvalue.SignedBlob()
   blob_rdf.Sign(content, sig_key, ver_key, prompt=True)
-  aff4_path = rdfvalue.RDFURN(aff4_path.format(platform=platform.lower(),
-                                               file_name=file_name))
+
   fd = aff4.FACTORY.Create(aff4_path, "GRRMemoryDriver", mode="w", token=token)
   fd.Set(fd.Schema.BINARY(blob_rdf))
 
-  if not install_request:
-    installer = rdfvalue.DriverInstallTemplate()
+  if install_request is None:
     # Create install_request from the configuration.
-    installer.device_path = config_lib.CONFIG.Get(
-        "MemoryDriver.device_path", context=client_context)
+    install_request = rdfvalue.DriverInstallTemplate(
+        device_path=config_lib.CONFIG.Get(
+            "MemoryDriver.device_path", context=client_context),
+        driver_display_name=config_lib.CONFIG.Get(
+            "MemoryDriver.driver_display_name", context=client_context),
+        driver_name=config_lib.CONFIG.Get(
+            "MemoryDriver.driver_service_name", context=client_context))
 
-    if platform == "Windows":
-      installer.driver_display_name = config_lib.CONFIG.Get(
-          "MemoryDriver.driver_display_name", context=client_context)
-
-      installer.driver_name = config_lib.CONFIG.Get(
-          "MemoryDriver.driver_service_name", context=client_context)
-
-  else:
-    installer = install_request
-
-  fd.Set(fd.Schema.INSTALLATION(installer))
+  fd.Set(fd.Schema.INSTALLATION(install_request))
   fd.Close()
   logging.info("Uploaded to %s", fd.urn)
-  return str(fd.urn)
+  return fd.urn
 
 
 def GetConfigBinaryPathType(aff4_path):
@@ -161,16 +142,21 @@ def GetConfigBinaryPathType(aff4_path):
 
 def CreateBinaryConfigPaths(token=None):
   """Create the paths required for binary configs."""
-  required_dirs = set(["drivers", "executables", "python_hacks"])
   required_urns = set()
 
   try:
-    for req_dir in required_dirs:
-      required_urns.add("aff4:/config/%s" % req_dir)
-
-    # We weren't already initialized, create all directories.
+    # We weren't already initialized, create all directories we will need.
     for platform in SUPPORTED_PLATFORMS:
-      required_urns.add("aff4:/config/drivers/%s/memory" % platform)
+      for arch in SUPPORTED_ARCHICTECTURES:
+        client_context = ["Platform:%s" % platform.title(),
+                          "Arch:%s" % arch]
+
+        aff4_path = rdfvalue.RDFURN(
+            config_lib.CONFIG.Get("MemoryDriver.aff4_path",
+                                  context=client_context))
+
+        required_urns.add(aff4_path.Basename())
+
       required_urns.add("aff4:/config/executables/%s/agentupdates" % platform)
       required_urns.add("aff4:/config/executables/%s/installers" % platform)
 
@@ -216,11 +202,12 @@ def _RepackBinary(context, builder_cls):
       return builder_obj.MakeDeployableBinary(template_path)
     except Exception as e:  # pylint: disable=broad-except
       print "Repacking template %s failed: %s" % (template_path, e)
+      raise
   else:
     print "Template %s missing - will not repack." % template_path
 
 
-def RepackAllBinaries(upload=False):
+def RepackAllBinaries(upload=False, debug_build=False):
   """Repack binaries based on the configuration.
 
   NOTE: The configuration file specifies the location of the binaries
@@ -235,6 +222,7 @@ def RepackAllBinaries(upload=False):
 
   Args:
     upload: If specified we also upload the repacked binary into the datastore.
+    debug_build: Repack as a debug build.
 
   Returns:
     A list of output installers generated.
@@ -242,6 +230,8 @@ def RepackAllBinaries(upload=False):
   built = []
 
   base_context = ["ClientBuilder Context"]
+  if debug_build:
+    base_context += ["ClientDebug Context"]
   for context, deployer in (
       (["Target:Windows", "Platform:Windows", "Arch:amd64"],
        build.WindowsClientDeployer),
@@ -259,7 +249,58 @@ def RepackAllBinaries(upload=False):
       if upload:
         dest = config_lib.CONFIG.Get("Executables.installer",
                                      context=context)
+        if debug_build:
+          dest = rdfvalue.RDFURN(dest)
+          dest = rdfvalue.RDFURN(dest.Dirname()).Add("dbg_%s" % dest.Basename())
         UploadSignedConfigBlob(open(output_path).read(100*1024*1024),
                                dest, client_context=context)
 
   return built
+
+
+def RebuildIndex(urn, primary_attribute, indexed_attributes, token):
+  """Rebuild the Label Indexes."""
+  index_urn = rdfvalue.RDFURN(urn)
+
+  logging.info("Deleting index %s", urn)
+  data_store.DB.DeleteSubject(index_urn, sync=True)
+  attribute_predicates = [a.predicate for a in indexed_attributes]
+  filter_obj = data_store.DB.filter.HasPredicateFilter(
+      primary_attribute.predicate)
+
+  index = aff4.FACTORY.Create(index_urn, "AFF4Index",
+                              token=token, mode="w")
+
+  for row in data_store.DB.Query(attributes=attribute_predicates,
+                                 filter_obj=filter_obj, limit=1000000):
+    try:
+      subject = row["subject"][0][0]
+      urn = rdfvalue.RDFURN(subject)
+    except ValueError:
+      continue
+    for attribute in indexed_attributes:
+      value = row.get(attribute.predicate)
+      if value:
+        value = value[0][0]
+      if value:
+        logging.debug("Adding: %s %s %s", str(urn), attribute.predicate, value)
+        index.Add(urn, attribute, value)
+  logging.info("Flushing index %s", urn)
+  index.Flush(sync=True)
+
+
+def RebuildLabelIndexes(token):
+  """Rebuild the Label Indexes."""
+  RebuildIndex("/index/label",
+               primary_attribute=aff4.AFF4Object.SchemaCls.LABEL,
+               indexed_attributes=[aff4.AFF4Object.SchemaCls.LABEL],
+               token=token)
+
+
+def RebuildClientIndexes(token=None):
+  """Rebuild the Client Indexes."""
+  indexed_attributes = [a for a in aff4.VFSGRRClient.SchemaCls.ListAttributes()
+                        if a.index]
+  RebuildIndex("/index/client",
+               primary_attribute=aff4.VFSGRRClient.SchemaCls.HOSTNAME,
+               indexed_attributes=indexed_attributes, token=token)

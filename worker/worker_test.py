@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """Tests for the worker."""
 
 
@@ -13,9 +12,8 @@ from grr.lib import aff4
 from grr.lib import data_store
 from grr.lib import flags
 from grr.lib import flow
-from grr.lib import flow_runner
+from grr.lib import queue_manager
 from grr.lib import rdfvalue
-from grr.lib import scheduler
 from grr.lib import test_lib
 from grr.lib import worker
 
@@ -69,22 +67,28 @@ class WorkerSendingWKTestFlow(flow.WellKnownFlow):
 class GrrWorkerTest(test_lib.FlowTestsBaseclass):
   """Tests the GRR Worker."""
 
-  def SendResponse(self, session_id, data, client_id=None, send_status=True):
+  def SendResponse(self, session_id, data, client_id=None, well_known=False):
     if not isinstance(data, rdfvalue.RDFValue):
       data = rdfvalue.DataBlob(string=data)
-    with flow_runner.FlowManager(token=self.token) as flow_manager:
+    if well_known:
+      request_id, response_id = 0, 12345
+    else:
+      request_id, response_id = 1, 1
+    with queue_manager.QueueManager(token=self.token) as flow_manager:
       flow_manager.QueueResponse(session_id, rdfvalue.GrrMessage(
           source=client_id,
           session_id=session_id,
           payload=data,
-          request_id=1, response_id=1))
-      if send_status:
+          request_id=request_id,
+          response_id=response_id))
+      if not well_known:
+        # For normal flows we have to send a status as well.
         flow_manager.QueueResponse(session_id, rdfvalue.GrrMessage(
             source=client_id,
             session_id=session_id,
             payload=rdfvalue.GrrStatus(
                 status=rdfvalue.GrrStatus.ReturnedStatus.OK),
-            request_id=1, response_id=2,
+            request_id=request_id, response_id=response_id+1,
             type=rdfvalue.GrrMessage.Type.STATUS))
 
     # Signal on the worker queue that this flow is ready.
@@ -94,7 +98,7 @@ class GrrWorkerTest(test_lib.FlowTestsBaseclass):
   def testProcessMessages(self):
     """Test processing of several inbound messages."""
     worker_obj = worker.GRRWorker(worker.DEFAULT_WORKER_QUEUE,
-                                  run_cron=False, token=self.token)
+                                  token=self.token)
 
     # Create a couple of flows
     flow_obj = self.FlowSetup("WorkerSendingTestFlow")
@@ -105,9 +109,9 @@ class GrrWorkerTest(test_lib.FlowTestsBaseclass):
     session_id_2 = flow_obj.session_id
     flow_obj.Close()
 
+    manager = queue_manager.QueueManager(token=self.token)
     # Check that client queue has messages
-    tasks_on_client_queue = scheduler.SCHEDULER.Query(
-        self.client_id, 100, token=self.token)
+    tasks_on_client_queue = manager.Query(self.client_id.Queue(), 100)
 
     # should have 10 requests from WorkerSendingTestFlow and 1 from
     # SendingTestFlow2
@@ -135,34 +139,38 @@ class GrrWorkerTest(test_lib.FlowTestsBaseclass):
 
     # Check that client queue is cleared - should have 2 less messages (since
     # two were completed).
-    tasks_on_client_queue = scheduler.SCHEDULER.Query(
-        self.client_id, 100, token=self.token)
+    tasks_on_client_queue = manager.Query(self.client_id.Queue(), 100)
 
     self.assertEqual(len(tasks_on_client_queue), 9)
 
     # Ensure that processed requests are removed from state subject
     self.assertEqual((None, 0), data_store.DB.Resolve(
-        flow_runner.FlowManager.FLOW_STATE_TEMPLATE % session_id_1,
-        flow_runner.FlowManager.FLOW_REQUEST_TEMPLATE % 1,
+        session_id_1.Add("state"),
+        manager.FLOW_REQUEST_TEMPLATE % 1,
         token=self.token))
 
+    # This flow is still in state Incoming.
     flow_obj = aff4.FACTORY.Open(session_id_1, token=self.token)
     self.assertTrue(flow_obj.state.context.state !=
                     rdfvalue.Flow.State.TERMINATED)
+    self.assertEqual(flow_obj.state.context["current_state"],
+                     "Incoming")
+    # This flow should be done.
     flow_obj = aff4.FACTORY.Open(session_id_2, token=self.token)
     self.assertTrue(flow_obj.state.context.state ==
                     rdfvalue.Flow.State.TERMINATED)
+    self.assertEqual(flow_obj.state.context["current_state"],
+                     "End")
 
   def testProcessMessagesWellKnown(self):
     worker_obj = worker.GRRWorker(worker.DEFAULT_WORKER_QUEUE,
-                                  run_cron=False, token=self.token)
+                                  token=self.token)
 
     # Send a message to a WellKnownFlow - ClientStatsAuto.
     client_id = rdfvalue.ClientURN("C.1100110011001100")
     self.SendResponse(rdfvalue.SessionID("aff4:/flows/W:Stats"),
                       data=rdfvalue.ClientStats(RSS_size=1234),
-                      client_id=client_id,
-                      send_status=False)
+                      client_id=client_id, well_known=True)
 
     # Process all messages
     worker_obj.RunOnce()
@@ -180,11 +188,11 @@ class GrrWorkerTest(test_lib.FlowTestsBaseclass):
 
   def CheckNotificationsDisappear(self, session_id):
     worker_obj = worker.GRRWorker(worker.DEFAULT_WORKER_QUEUE,
-                                  run_cron=False, token=self.token)
-    scheduler.SCHEDULER.NotifyQueue(session_id, token=self.token)
+                                  token=self.token)
+    manager = queue_manager.QueueManager(token=self.token)
+    manager.NotifyQueue(session_id)
 
-    sessions = scheduler.SCHEDULER.GetSessionsFromQueue("aff4:/W",
-                                                        token=self.token)
+    sessions = manager.GetSessionsFromQueue(worker.DEFAULT_WORKER_QUEUE)
     # Check the notification is there.
     self.assertEqual(len(sessions), 1)
     self.assertEqual(sessions[0], session_id)
@@ -193,8 +201,7 @@ class GrrWorkerTest(test_lib.FlowTestsBaseclass):
     worker_obj.RunOnce()
     worker_obj.thread_pool.Join()
 
-    sessions = scheduler.SCHEDULER.GetSessionsFromQueue("aff4:/W",
-                                                        token=self.token)
+    sessions = manager.GetSessionsFromQueue(worker.DEFAULT_WORKER_QUEUE)
     # Check the notification is now gone.
     self.assertEqual(len(sessions), 0)
 
@@ -205,15 +212,22 @@ class GrrWorkerTest(test_lib.FlowTestsBaseclass):
     self.CheckNotificationsDisappear(session_id)
 
     # Now check objects that are actually broken.
-    session_id = rdfvalue.SessionID("aff4:/flows/W:testobj")
-    obj = aff4.FACTORY.Create(session_id, "GRRFlow", token=self.token)
-    obj.Close()
+
+    # Start a new flow.
+    session_id = flow.GRRFlow.StartFlow(flow_name="WorkerSendingTestFlow",
+                                        client_id=self.client_id,
+                                        token=self.token)
     # Overwrite the type of the object such that opening it will now fail.
     data_store.DB.Set(session_id, "aff4:type", "DeprecatedClass",
                       token=self.token)
 
+    # Starting a new flow schedules notifications for the worker already but
+    # this test actually checks that there are none. Thus, we have to delete
+    # them or the test fails.
+    data_store.DB.DeleteSubject(worker.DEFAULT_WORKER_QUEUE, token=self.token)
+
     # Check it really does.
-    with self.assertRaises(aff4.InstanciationError):
+    with self.assertRaises(aff4.InstantiationError):
       aff4.FACTORY.Open(session_id, token=self.token)
 
     self.CheckNotificationsDisappear(session_id)

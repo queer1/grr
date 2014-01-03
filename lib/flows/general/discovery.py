@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """These are flows designed to discover information about the host."""
 
 
@@ -9,8 +8,8 @@ from grr.lib import aff4
 from grr.lib import constants
 from grr.lib import flow
 from grr.lib import rdfvalue
-from grr.lib import type_info
 from grr.lib import utils
+from grr.proto import flows_pb2
 
 
 class EnrolmentInterrogateEvent(flow.EventListener):
@@ -18,12 +17,18 @@ class EnrolmentInterrogateEvent(flow.EventListener):
   EVENTS = ["ClientEnrollment"]
   well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:Interrogate")
 
-  sourcecheck = lambda source: source == "aff4:/CAEnroler"
+  # We only accept messages that came from the CA flows.
+  sourcecheck = lambda source: source.Basename().startswith("CA:")
 
   @flow.EventHandler(source_restriction=sourcecheck)
   def ProcessMessage(self, message=None, event=None):
     _ = message
-    flow.GRRFlow.StartFlow(event.common_name, "Interrogate", token=self.token)
+    flow.GRRFlow.StartFlow(client_id=event,
+                           flow_name="Interrogate", token=self.token)
+
+
+class InterrogateArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.InterrogateArgs
 
 
 class Interrogate(flow.GRRFlow):
@@ -31,22 +36,23 @@ class Interrogate(flow.GRRFlow):
 
   category = "/Administrative/"
   client = None
+  args_type = InterrogateArgs
+  behaviours = flow.GRRFlow.behaviours + "BASIC"
 
-  flow_typeinfo = type_info.TypeDescriptorSet(
-      type_info.Bool(
-          description="Perform a light weight version of the interrogate.",
-          name="lightweight",
-          default=False)
-      )
-
-  @flow.StateHandler(next_state=["Hostname", "Platform",
-                                 "InstallDate", "EnumerateUsers",
+  @flow.StateHandler(next_state=["Hostname",
+                                 "Platform",
+                                 "InstallDate",
                                  "EnumerateInterfaces",
                                  "EnumerateFilesystems",
-                                 "ClientInfo", "ClientConfig",
-                                 "ClientConfiguration", "VerifyUsers"])
+                                 "ClientInfo",
+                                 "ClientConfig",
+                                 "ClientConfiguration"])
   def Start(self):
     """Start off all the tests."""
+    self.state.Register("sid_data", {})
+    self.state.Register("summary", rdfvalue.ClientSummary(
+        client_id=self.client_id))
+
     # Create the objects we need to exist.
     self.Load()
     fd = aff4.FACTORY.Create(self.client.urn.Add("network"), "Network",
@@ -61,25 +67,12 @@ class Interrogate(flow.GRRFlow):
     self.CallClient("GetConfig", next_state="ClientConfig")
     self.CallClient("GetConfiguration", next_state="ClientConfiguration")
 
-    if not self.state.lightweight:
-      self.state.Register("sid_data", {})
-      profiles_key = (r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft"
-                      r"\Windows NT\CurrentVersion\ProfileList")
-
-      request = rdfvalue.RDFFindSpec(path_regex="ProfileImagePath", max_depth=2)
-
-      request.pathspec.path = profiles_key
-      request.pathspec.pathtype = request.pathspec.PathType.REGISTRY
-
-      # Download all the Registry keys, it is limited by max_depth.
-      request.iterator.number = 10000
-      self.CallClient("Find", request, next_state="VerifyUsers")
-      self.CallClient("EnumerateInterfaces", next_state="EnumerateInterfaces")
-      self.CallClient("EnumerateFilesystems", next_state="EnumerateFilesystems")
+    self.CallClient("EnumerateInterfaces", next_state="EnumerateInterfaces")
+    self.CallClient("EnumerateFilesystems", next_state="EnumerateFilesystems")
 
   def Load(self):
     # Ensure there is a client object
-    self.client = aff4.FACTORY.Open(self.state.context.client_id,
+    self.client = aff4.FACTORY.Open(self.client_id,
                                     mode="rw", token=self.token)
 
   def Save(self):
@@ -88,13 +81,63 @@ class Interrogate(flow.GRRFlow):
       self.client.Close()
       self.client = None
 
-  @flow.StateHandler(next_state=["GetFolders", "EnumerateUsers"])
+  @flow.StateHandler(next_state=["VerifyUsers", "EnumerateUsers"])
+  def Platform(self, responses):
+    """Stores information about the platform."""
+    if responses.success:
+      response = responses.First()
+
+      self.state.summary.system_info = response
+
+      # These need to be in separate attributes because they get searched on in
+      # the GUI
+      self.client.Set(self.client.Schema.HOSTNAME(response.node))
+      self.client.Set(self.client.Schema.SYSTEM(response.system))
+      self.client.Set(self.client.Schema.OS_RELEASE(response.release))
+      self.client.Set(self.client.Schema.OS_VERSION(response.version))
+      self.client.Set(self.client.Schema.FQDN(response.fqdn))
+
+      # response.machine is the machine value of platform.uname()
+      # On Windows this is the value of:
+      # HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Session
+      # Manager\Environment\PROCESSOR_ARCHITECTURE
+      # "AMD64", "IA64" or "x86"
+      self.client.Set(self.client.Schema.ARCH(response.machine))
+      self.client.Set(self.client.Schema.UNAME("%s-%s-%s" % (
+          response.system, response.release, response.version)))
+
+      # Windows systems get registry hives and "manual" way of enumerating
+      # users.
+      if response.system == "Windows":
+        fd = aff4.FACTORY.Create(self.client.urn.Add("registry"),
+                                 "VFSDirectory", token=self.token)
+        fd.Set(fd.Schema.PATHSPEC, fd.Schema.PATHSPEC(
+            path="/", pathtype=rdfvalue.PathSpec.PathType.REGISTRY))
+        fd.Close()
+
+        profiles_key = (r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft"
+                        r"\Windows NT\CurrentVersion\ProfileList")
+
+        request = rdfvalue.FindSpec(path_regex="ProfileImagePath", max_depth=2)
+
+        request.pathspec.path = profiles_key
+        request.pathspec.pathtype = request.pathspec.PathType.REGISTRY
+
+        # Download all the Registry keys, it is limited by max_depth.
+        request.iterator.number = 10000
+        self.CallClient("Find", request, next_state="VerifyUsers")
+
+      else:
+        self.CallClient("EnumerateUsers", next_state="EnumerateUsers")
+
+    else:
+      self.Log("Could not retrieve Platform info.")
+
+  @flow.StateHandler(next_state=["GetFolders"])
   def VerifyUsers(self, responses):
     """Issues WMI queries that verify that the SIDs actually belong to users."""
     if not responses.success:
-      self.Log("Cannot query registry for user information, "
-               " using EnumerateUsers.")
-      self.CallClient("EnumerateUsers", next_state="EnumerateUsers")
+      self.Log("Cannot query registry for user information. ")
       return
 
     for response in responses:
@@ -111,9 +154,11 @@ class Interrogate(flow.GRRFlow):
       self.state.sid_data[sid] = {"homedir": homedir,
                                   "username": user,
                                   "sid": sid}
-      query = "SELECT * FROM Win32_UserAccount WHERE name=\"%s\"" % user
-      self.CallClient("WmiQuery", query=query, next_state="GetFolders",
-                      request_data={"SID": sid})
+
+      if not self.args.lightweight:
+        query = "SELECT * FROM Win32_UserAccount WHERE name=\"%s\"" % user
+        self.CallClient("WmiQuery", query=query, next_state="GetFolders",
+                        request_data={"SID": sid})
 
   @flow.StateHandler(next_state=["VerifyFolders"])
   def GetFolders(self, responses):
@@ -121,15 +166,16 @@ class Interrogate(flow.GRRFlow):
     if not responses.success:
       return
 
-    for acc in responses:
+    for response in responses:
       # It could happen that wmi returns an AD user with the same name as the
       # local one. In this case, we just ignore the unknown SID.
-      if acc["SID"] not in self.state.sid_data.iterkeys():
+      if response["SID"] not in self.state.sid_data:
         continue
 
-      self.state.sid_data[acc["SID"]]["domain"] = acc["Domain"]
-      folder_path = (r"HKEY_USERS\%s\Software\Microsoft\Windows"
-                     r"\CurrentVersion\Explorer\Shell Folders") % acc["SID"]
+      self.state.sid_data[response["SID"]]["domain"] = response["Domain"]
+      folder_path = (
+          r"HKEY_USERS\%s\Software\Microsoft\Windows"
+          r"\CurrentVersion\Explorer\Shell Folders") % response["SID"]
       self.CallClient("ListDirectory",
                       pathspec=rdfvalue.PathSpec(
                           path=folder_path,
@@ -153,10 +199,6 @@ class Interrogate(flow.GRRFlow):
       # Save the user pb.
       data = self.state.sid_data[responses.request_data["SID"]]
       data["special_folders"] = rdfvalue.FolderInformation(**profile_folders)
-
-      if self.OutstandingRequests() == 1:
-        # This is the last response -> save all data.
-        self.SaveUsers()
 
     else:
       # Reading from registry failed, we have to guess.
@@ -187,61 +229,30 @@ class Interrogate(flow.GRRFlow):
 
       data["special_folders"] = folder
 
-    if self.OutstandingRequests() == 1:
-      # This is the last response -> save all the data.
-      self.SaveUsers()
-
   def SaveUsers(self):
     """This saves the collected data to the data store."""
     user_list = self.client.Schema.USER()
     usernames = []
-    for sid in self.state.sid_data.iterkeys():
-      data = self.state.sid_data[sid]
+    for data in self.state.sid_data.itervalues():
       usernames.append(data["username"])
-      user_list.Append(rdfvalue.User(**data))
+
+      user = rdfvalue.User(**data)
+      self.state.summary.users.Append(user)
+
+      user_list.Append(user)
       self.client.AddAttribute(self.client.Schema.USER, user_list)
+
     self.client.AddAttribute(self.client.Schema.USERNAMES(
         " ".join(sorted(usernames))))
-
-  @flow.StateHandler()
-  def Platform(self, responses):
-    """Stores information about the platform."""
-    if responses.success:
-      response = responses.First()
-
-      # These need to be in separate attributes because they get searched on in
-      # the GUI
-      self.client.Set(self.client.Schema.HOSTNAME(response.node))
-      self.client.Set(self.client.Schema.SYSTEM(response.system))
-      self.client.Set(self.client.Schema.OS_RELEASE(response.release))
-      self.client.Set(self.client.Schema.OS_VERSION(response.version))
-      self.client.Set(self.client.Schema.FQDN(response.fqdn))
-
-      # response.machine is the machine value of platform.uname()
-      # On Windows this is the value of:
-      # HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Session
-      # Manager\Environment\PROCESSOR_ARCHITECTURE
-      # "AMD64", "IA64" or "x86"
-      self.client.Set(self.client.Schema.ARCH(response.machine))
-      self.client.Set(self.client.Schema.UNAME("%s-%s-%s" % (
-          response.system, response.release, response.version)))
-
-      # Windows systems get registry hives
-      if response.system == "Windows":
-        fd = aff4.FACTORY.Create(self.client.urn.Add("registry"),
-                                 "VFSDirectory", token=self.token)
-        fd.Set(fd.Schema.PATHSPEC, fd.Schema.PATHSPEC(
-            path="/", pathtype=rdfvalue.PathSpec.PathType.REGISTRY))
-        fd.Close()
-    else:
-      self.Log("Could not retrieve Platform info.")
 
   @flow.StateHandler()
   def InstallDate(self, responses):
     if responses.success:
       response = responses.First()
-      self.client.Set(self.client.Schema.INSTALL_DATE(
-          response.integer * 1000000))
+      install_date = self.client.Schema.INSTALL_DATE(
+          response.integer * 1000000)
+      self.client.Set(install_date)
+      self.state.summary.install_date = install_date
     else:
       self.Log("Could not get InstallDate")
 
@@ -254,6 +265,8 @@ class Interrogate(flow.GRRFlow):
       # Add all the users to the client object
       for response in responses:
         user_list.Append(response)
+        self.state.summary.users.Append(response)
+
         if response.username:
           usernames.append(response.username)
 
@@ -276,13 +289,16 @@ class Interrogate(flow.GRRFlow):
         interface_list.Append(response)
 
         # Add a hex encoded string for searching
-        if response.mac_address != "\x00" * len(response.mac_address):
-          mac_addresses.append(response.mac_address.encode("hex"))
+        if (response.mac_address and
+            response.mac_address != "\x00" * len(response.mac_address)):
+          mac_addresses.append(response.mac_address.human_readable_address)
 
       self.client.Set(self.client.Schema.MAC_ADDRESS(
           "\n".join(mac_addresses)))
       net_fd.Set(net_fd.Schema.INTERFACES, interface_list)
       net_fd.Close()
+
+      self.state.summary.interfaces = interface_list
     else:
       self.Log("Could not enumerate interfaces.")
 
@@ -353,7 +369,10 @@ class Interrogate(flow.GRRFlow):
     """Obtain some information about the GRR client running."""
     if responses.success:
       response = responses.First()
+      self.state.summary.client_info = response
       self.client.Set(self.client.Schema.CLIENT_INFO(response))
+      self.client.AddLabels(response.labels)
+      self.state.summary.client_info = response
     else:
       self.Log("Could not get ClientInfo.")
 
@@ -374,12 +393,16 @@ class Interrogate(flow.GRRFlow):
   @flow.StateHandler()
   def End(self):
     """Finalize client registration."""
-    # Create the bare VFS with empty virtual directories.
-    fd = aff4.FACTORY.Create(self.client.urn.Add("processes"), "ProcessListing",
-                             token=self.token)
-    fd.Close()
+    if self.state.sid_data:
+      self.SaveUsers()
 
     self.Notify("Discovery", self.client.urn, "Client Discovery Complete")
+
+    # Publish this client to the Discovery queue.
+    self.state.summary.timestamp = rdfvalue.RDFDatetime().Now()
+    self.Publish("Discovery", self.state.summary)
+    self.SendReply(self.state.summary)
+    self.client.Set(self.client.Schema.SUMMARY, self.state.summary)
 
     # Flush the data to the data store.
     self.client.Close()

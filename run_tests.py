@@ -12,16 +12,18 @@ import sys
 import time
 import unittest
 
+# pylint: disable=unused-import,g-bad-import-order
+from grr.lib import server_plugins
+from grr.client import tests
+# pylint: enable=unused-import,g-bad-import-order
+
 # These need to register plugins so, pylint: disable=unused-import
-from grr.client import client_test
-from grr.client import client_utils_test
-from grr.client import client_vfs_test
-from grr.client.client_actions import action_test
 from grr.lib import flags
 from grr.lib import test_lib
 from grr.lib import tests
 from grr.lib import utils
 from grr.parsers import tests
+from grr.tools.export_plugins import tests
 from grr.worker import worker_test
 
 
@@ -195,7 +197,8 @@ def main(argv=None):
 
         # Maintain metadata about each test.
         processes[name] = dict(pipe=subprocess.Popen(argv),
-                               start=time.time(), output_path=result_filename)
+                               start=time.time(), output_path=result_filename,
+                               test=name)
 
         WaitForAvailableProcesses(
             processes, max_processes=flags.FLAGS.processes,
@@ -205,13 +208,20 @@ def main(argv=None):
       WaitForAvailableProcesses(processes, max_processes=0,
                                 completion_cb=ReportTestResult)
 
-      passed_tests = len([p for p in processes.values() if p["exit_code"] == 0])
-      failed_tests = len([p for p in processes.values() if p["exit_code"] != 0])
+      passed_tests = [p for p in processes.values() if p["exit_code"] == 0]
+      failed_tests = [p for p in processes.values() if p["exit_code"] != 0]
 
       print "\nRan %s tests in %0.2f sec, %s tests passed, %s tests failed." % (
-          len(processes), time.time() - start, passed_tests, failed_tests)
+          len(processes), time.time() - start, len(passed_tests),
+          len(failed_tests))
 
       if failed_tests:
+        colorizer = Colorizer()
+
+        print "Failing tests: "
+        for metadata in failed_tests:
+          print colorizer.Render("RED", metadata["test"])
+
         sys.exit(-1)
 
 if __name__ == "__main__":

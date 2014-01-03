@@ -5,10 +5,13 @@
 import argparse
 import ConfigParser
 import getpass
+import json
 import os
+import re
 # importing readline enables the raw_input calls to have history etc.
 import readline  # pylint: disable=unused-import
 import sys
+import urlparse
 
 
 # pylint: disable=unused-import,g-bad-import-order
@@ -16,8 +19,9 @@ from grr.lib import server_plugins
 # pylint: enable=g-bad-import-order,unused-import
 
 from grr.lib import aff4
+from grr.lib import artifact
+from grr.lib import artifact_lib
 from grr.lib import config_lib
-from grr.lib import data_store
 from grr.lib import flags
 
 # pylint: disable=g-import-not-at-top,no-name-in-module
@@ -31,7 +35,7 @@ from grr.lib import maintenance_utils
 from grr.lib import rdfvalue
 from grr.lib import startup
 from grr.lib import utils
-from grr.lib.aff4_objects import user_managers
+from grr.lib.aff4_objects import users
 # pylint: enable=g-import-not-at-top,no-name-in-module
 
 
@@ -66,31 +70,75 @@ parser_initialize = subparsers.add_parser(
     help="Interactively run all the required steps to setup a new GRR install.")
 
 
-# Parent parser used in other user based parsers.
-parser_user_args = argparse.ArgumentParser(add_help=False)
+# Update an existing user.
+parser_update_user = subparsers.add_parser(
+    "update_user", help="Update user settings.")
 
-# User arguments.
-parser_user_args.add_argument(
-    "--username", required=True,
-    help="Username to create.")
-parser_user_args.add_argument(
-    "--noadmin", default=False, action="store_true",
-    help="Don't create the user as an administrator.")
-parser_user_args.add_argument(
-    "--password", default=None,
-    help="Password to set for the user. If None, user will be prompted.")
-parser_user_args.add_argument(
+parser_update_user.add_argument("username", help="Username to update.")
+
+parser_update_user.add_argument(
+    "--password", default=None, help="Reset the password for this user..")
+
+parser_update_user.add_argument(
     "--label", default=[], action="append",
-    help="Labels to add to the user object. These are used to control access.")
-
+    help=("Labels to set the user object. These are used to control access."
+          "Note that previous labels are cleared."))
 
 parser_add_user = subparsers.add_parser(
-    "add_user", parents=[parser_user_args],
-    help="Add a user to the system.")
+    "add_user", help="Add a new user.")
 
-parser_update_user = subparsers.add_parser(
-    "update_user", parents=[parser_user_args],
-    help="Update user settings.")
+parser_add_user.add_argument("username", help="Username to update.")
+
+parser_add_user.add_argument(
+    "--noadmin", default=False, action="store_true",
+    help="Don't create the user as an administrator.")
+
+
+def UpdateUser(username, password, labels):
+  """Implementation of the update_user command."""
+  with aff4.FACTORY.Create("aff4:/users/%s" % username,
+                           "GRRUser", mode="rw") as fd:
+    # Note this accepts blank passwords as valid.
+    fd.SetPassword(password)
+
+    if labels:
+      # Allow labels to be comma separated list of labels.
+      expanded_labels = []
+      for label in labels:
+        if "," in label:
+          expanded_labels.extend(label.split(","))
+        else:
+          expanded_labels.append(label)
+
+      fd.SetLabels(*expanded_labels)
+
+  print "Updating user %s" % username
+  ShowUser(username)
+
+
+# Show user account.
+parser_show_user = subparsers.add_parser(
+    "show_user", help="Display user settings or list all users.")
+
+parser_show_user.add_argument(
+    "username", default=None, nargs="?",
+    help="Username to display. If not specified, list all users.")
+
+
+def ShowUser(username):
+  """Implementation o the show_user command."""
+  if username is None:
+    fd = aff4.FACTORY.Open("aff4:/users")
+    for user in fd.OpenChildren():
+      if isinstance(user, users.GRRUser):
+        print user.Describe()
+  else:
+    user = aff4.FACTORY.Open("aff4:/users/%s" % username)
+    if isinstance(user, users.GRRUser):
+      print user.Describe()
+    else:
+      print "User %s not found" % username
+
 
 # Generate Keys Arguments
 parser_generate_keys.add_argument(
@@ -116,16 +164,31 @@ parser_upload_args.add_argument(
     help="The destination path to upload the file to, specified in aff4: form,"
     "e.g. aff4:/config/test.raw")
 
+parser_upload_args.add_argument(
+    "--overwrite", default=False, action="store_true",
+    help="Required to overwrite existing files.")
+
 parser_upload_signed_args.add_argument(
     "--platform", required=True, choices=maintenance_utils.SUPPORTED_PLATFORMS,
     default="windows",
     help="The platform the file will be used on. This determines which signing"
     " keys to use, and the path on the server the file will be uploaded to.")
 
+parser_upload_signed_args.add_argument(
+    "--arch", required=True, choices=maintenance_utils.SUPPORTED_ARCHICTECTURES,
+    default="amd64",
+    help="The architecture the file will be used on. This determines "
+    " the path on the server the file will be uploaded to.")
+
 # Upload parsers.
 parser_upload_raw = subparsers.add_parser(
     "upload_raw", parents=[parser_upload_args],
     help="Upload a raw file to an aff4 path.")
+
+parser_upload_artifact = subparsers.add_parser(
+    "upload_artifact", parents=[parser_upload_args],
+    help="Upload a raw json artifact file.")
+
 
 parser_upload_python = subparsers.add_parser(
     "upload_python", parents=[parser_upload_args, parser_upload_signed_args],
@@ -146,27 +209,30 @@ parser_upload_memory_driver = subparsers.add_parser(
 def LoadMemoryDrivers(grr_dir):
   """Load memory drivers from disk to database."""
 
+  client_context = ["Platform:Darwin", "Arch:amd64"]
   f_path = os.path.join(grr_dir, config_lib.CONFIG.Get(
-      "MemoryDriver.driver_file", context=["Platform:Darwin", "Arch:amd64"]))
+      "MemoryDriver.driver_file", context=client_context))
 
   print "Signing and uploading %s" % f_path
   up_path = maintenance_utils.UploadSignedDriverBlob(
-      open(f_path).read(), platform="Darwin", file_name="pmem")
+      open(f_path).read(), client_context=client_context)
   print "uploaded %s" % up_path
 
+  client_context = ["Platform:Windows", "Arch:i386"]
   f_path = os.path.join(grr_dir, config_lib.CONFIG.Get(
-      "MemoryDriver.driver_file", context=["Platform:Windows", "Arch:i386"]))
+      "MemoryDriver.driver_file", context=client_context))
 
   print "Signing and uploading %s" % f_path
   up_path = maintenance_utils.UploadSignedDriverBlob(
-      open(f_path).read(), platform="Windows", file_name="winpmem.i386.sys")
+      open(f_path).read(), client_context=client_context)
   print "uploaded %s" % up_path
 
+  client_context = ["Platform:Windows", "Arch:amd64"]
   f_path = os.path.join(grr_dir, config_lib.CONFIG.Get(
-      "MemoryDriver.driver_file", context=["Platform:Windows", "Arch:amd64"]))
+      "MemoryDriver.driver_file", context=client_context))
   print "Signing and uploading %s" % f_path
   up_path = maintenance_utils.UploadSignedDriverBlob(
-      open(f_path).read(), platform="Windows", file_name="winpmem.amd64.sys")
+      open(f_path).read(), client_context=client_context)
   print "uploaded %s" % up_path
 
 
@@ -180,7 +246,7 @@ def ImportConfig(filename, config):
   options_imported = 0
   old_config = config_lib.CONFIG.MakeNewConfig()
   old_config.Initialize(filename)
-  user_manager = None
+
   for entry in old_config.raw_data.keys():
     try:
       section = entry.split(".")[0]
@@ -188,14 +254,7 @@ def ImportConfig(filename, config):
         config.Set(entry, old_config.Get(entry))
         print "Imported %s." % entry
         options_imported += 1
-      elif section == "Users":
-        if user_manager is None:
-          user_manager = user_managers.ConfigBasedUserManager()
-        user = entry.split(".", 1)[1]
-        hash_str, labels = old_config.Get(entry).split(":")
-        user_manager.SetRaw(user, hash_str, labels.split(","))
-        print "Imported user %s." % user
-        options_imported += 1
+
     except Exception as e:  # pylint: disable=broad-except
       print "Exception during import of %s: %s" % (entry, e)
   return options_imported
@@ -249,6 +308,22 @@ def GenerateKeys(config):
   GenerateDjangoKey(config)
 
 
+def RetryQuestion(question_text, output_re="", default_val=""):
+  """Continually ask a question until the output_re is matched."""
+  while True:
+    if default_val:
+      new_text = "%s [%s]: " % (question_text, default_val)
+    else:
+      new_text = "%s: " % question_text
+    output = raw_input(new_text) or default_val
+    output = output.strip()
+    if not output_re or re.match(output_re, output):
+      break
+    else:
+      print "Invalid input, must match %s" % output_re
+  return output
+
+
 def ConfigureBaseOptions(config):
   """Configure the basic options required to run the server."""
 
@@ -262,40 +337,55 @@ the client facing server and the admin user interface.\n"""
   try:
     hostname = maintenance_utils.GuessPublicHostname()
     print "Using %s as public hostname" % hostname
-  except (OSError, socket.gaierror):
+
+  except (OSError, IOError):
     print "Sorry, we couldn't guess your public hostname"
-    hostname = raw_input(
-        "Please enter it manually e.g. grr.example.com: ").strip()
+
+  hostname = RetryQuestion("Please enter your public hostname e.g. "
+                           "grr.example.com", "^([\\.A-Za-z0-9-]+)*$")
 
   print """\n\nServer URL
 The Server URL specifies the URL that the clients will connect to
 communicate with the server. This needs to be publically accessible. By default
 this will be port 8080 with the URL ending in /control.
 """
-  def_location = "http://%s:8080/control" % hostname
-  location = raw_input("Server URL [%s]: " % def_location) or def_location
-  config.Set("Client.location", location)
+  location = RetryQuestion("Server URL", "^http://.*/control$",
+                           "http://%s:8080/control" % hostname)
+  config.Set("Client.control_urls", [location])
+
+  frontend_port = urlparse.urlparse(location).port or 80
+  if frontend_port != config_lib.CONFIG.Get("Frontend.bind_port"):
+    config.Set("Frontend.bind_port", frontend_port)
+    print "\nSetting the frontend listening port to %d.\n" % frontend_port
+    print "Please make sure that this matches your client settings.\n"
 
   print """\nUI URL:
 The UI URL specifies where the Administrative Web Interface can be found.
 """
-  def_url = "http://%s:8000" % hostname
-  ui_url = raw_input("AdminUI URL [%s]: " % def_url) or def_url
+  ui_url = RetryQuestion("AdminUI URL", "^http://.*$",
+                         "http://%s:8000" % hostname)
   config.Set("AdminUI.url", ui_url)
+
+  print """\nMonitoring/Email domain name:
+Emails concerning alerts or updates must be sent to this domain.
+"""
+  domain = RetryQuestion("Email domain", "^([\\.A-Za-z0-9-]+)*$",
+                         "example.com")
+  config.Set("Logging.domain", domain)
 
   print """\nMonitoring email address
 Address where monitoring events get sent, e.g. crashed clients, broken server
 etc.
 """
-  def_email = "grr-emergency@example.com"
-  email = raw_input("Monitoring email [%s]: " % def_email) or def_email
-  config.Set("Monitoring.emergency_access_email", email)
+  email = RetryQuestion("Monitoring email", "",
+                        "grr-monitoring@%s" % domain)
+  config.Set("Monitoring.alert_email", email)
 
   print """\nEmergency email address
 Address where high priority events such as an emergency ACL bypass are sent.
 """
-  def_email = "grr-emergency@example.com"
-  emergency_email = raw_input("Emergency email [%s]: " % email) or email
+  emergency_email = RetryQuestion("Monitoring emergency email", "",
+                                  "grr-emergency@%s" % domain)
   config.Set("Monitoring.emergency_access_email", emergency_email)
 
   config.Write()
@@ -341,8 +431,7 @@ def Initialize(config=None):
 
   print "\nStep 3: Adding Admin User"
   password = getpass.getpass(prompt="Please enter password for user 'admin': ")
-  data_store.DB.security_manager.user_manager.UpdateUser(
-      "admin", password=password, admin=True)
+  UpdateUser("admin", password, ["admin"])
   print "User admin added."
 
   print "\nStep 4: Uploading Memory Drivers to the Database"
@@ -352,6 +441,9 @@ def Initialize(config=None):
   # We need to update the config to point to the installed templates now.
   config.Set("ClientBuilder.executables_path", os.path.join(
       flags.FLAGS.share_dir, "executables"))
+
+  # Build debug binaries, then build release binaries.
+  maintenance_utils.RepackAllBinaries(upload=True, debug_build=True)
   maintenance_utils.RepackAllBinaries(upload=True)
 
   print "\nInitialization complete, writing configuration."
@@ -374,7 +466,10 @@ def main(unused_argv):
   config_lib.CONFIG.AddContext("ConfigUpdater Context")
   startup.Init()
 
-  print "Using configuration %s" % config_lib.CONFIG.parser
+  try:
+    print "Using configuration %s" % config_lib.CONFIG.parser
+  except AttributeError:
+    raise RuntimeError("No valid config specified.")
 
   if flags.FLAGS.subparser_name == "load_memory_drivers":
     LoadMemoryDrivers(flags.FLAGS.share_dir)
@@ -390,39 +485,36 @@ def main(unused_argv):
 
   elif flags.FLAGS.subparser_name == "repack_clients":
     maintenance_utils.RepackAllBinaries(upload=flags.FLAGS.upload)
-
-  if flags.FLAGS.subparser_name == "add_user":
-    if flags.FLAGS.password:
-      password = flags.FLAGS.password
-    else:
-      password = getpass.getpass(prompt="Please enter password for user %s: " %
-                                 flags.FLAGS.username)
-    admin = not flags.FLAGS.noadmin
-    data_store.DB.security_manager.user_manager.AddUser(
-        flags.FLAGS.username, password=password, admin=admin,
-        labels=flags.FLAGS.label)
-
-  elif flags.FLAGS.subparser_name == "update_user":
-    admin = not flags.FLAGS.noadmin
-    data_store.DB.security_manager.user_manager.UpdateUser(
-        flags.FLAGS.username, password=flags.FLAGS.password, admin=admin,
-        labels=flags.FLAGS.label)
+    maintenance_utils.RepackAllBinaries(upload=flags.FLAGS.upload,
+                                        debug_build=True)
 
   elif flags.FLAGS.subparser_name == "initialize":
     Initialize(config_lib.CONFIG)
 
+  elif flags.FLAGS.subparser_name == "show_user":
+    ShowUser(flags.FLAGS.username)
+
+  elif flags.FLAGS.subparser_name == "update_user":
+    UpdateUser(flags.FLAGS.username, flags.FLAGS.password, flags.FLAGS.label)
+
+  elif flags.FLAGS.subparser_name == "add_user":
+    password = getpass.getpass(prompt="Please enter password for user '%s': " %
+                               flags.FLAGS.username)
+    labels = []
+    if not flags.FLAGS.noadmin:
+      labels.append("admin")
+    UpdateUser(flags.FLAGS.username, password, labels)
+
   elif flags.FLAGS.subparser_name == "upload_python":
     content = open(flags.FLAGS.file).read(1024*1024*30)
-    if flags.FLAGS.dest_path:
-      uploaded = maintenance_utils.UploadSignedConfigBlob(
-          content, platform=flags.FLAGS.platform,
-          aff4_path=flags.FLAGS.dest_path)
-    else:
-      uploaded = maintenance_utils.UploadSignedConfigBlob(
-          content, file_name=os.path.basename(flags.FLAGS.file),
-          platform=flags.FLAGS.platform,
-          aff4_path="/config/python_hacks/{file_name}")
-    print "Uploaded to %s" % uploaded
+    aff4_path = flags.FLAGS.dest_path
+    if not aff4_path:
+      python_hack_root_urn = config_lib.CONFIG.Get("Config.python_hack_root")
+      aff4_path = python_hack_root_urn.Add(os.path.basename(flags.FLAGS.file))
+    context = ["Platform:%s" % flags.FLAGS.platform.title(),
+               "Client"]
+    maintenance_utils.UploadSignedConfigBlob(content, aff4_path=aff4_path,
+                                             client_context=context)
 
   elif flags.FLAGS.subparser_name == "upload_exe":
     content = open(flags.FLAGS.file).read(1024*1024*30)
@@ -443,15 +535,19 @@ def main(unused_argv):
     print "Uploaded to %s" % dest_path
 
   elif flags.FLAGS.subparser_name == "upload_memory_driver":
+    client_context = ["Platform:%s" % flags.FLAGS.platform.title(),
+                      "Arch:%s" % flags.FLAGS.arch]
     content = open(flags.FLAGS.file).read(1024*1024*30)
+
     if flags.FLAGS.dest_path:
       uploaded = maintenance_utils.UploadSignedDriverBlob(
-          content, platform=flags.FLAGS.platform,
-          aff4_path=flags.FLAGS.dest_path)
+          content, aff4_path=flags.FLAGS.dest_path,
+          client_context=client_context)
+
     else:
       uploaded = maintenance_utils.UploadSignedDriverBlob(
-          content, platform=flags.FLAGS.platform,
-          file_name=os.path.basename(flags.FLAGS.file))
+          content, client_context=client_context)
+
     print "Uploaded to %s" % uploaded
 
   elif flags.FLAGS.subparser_name == "upload_raw":
@@ -460,10 +556,15 @@ def main(unused_argv):
     uploaded = UploadRaw(flags.FLAGS.file, flags.FLAGS.dest_path)
     print "Uploaded to %s" % uploaded
 
-
-def ConsoleMain():
-  """Helper function for calling with setup tools entry points."""
-  flags.StartMain(main)
+  elif flags.FLAGS.subparser_name == "upload_artifact":
+    json.load(open(flags.FLAGS.file))  # Check it will parse.
+    base_urn = aff4.ROOT_URN.Add("artifact_store")
+    try:
+      artifact.UploadArtifactJsonFile(
+          open(flags.FLAGS.file).read(1000000), base_urn=base_urn, token=None,
+          overwrite=flags.FLAGS.overwrite)
+    except artifact_lib.ArtifactDefinitionError as e:
+      print "Error %s. You may need to set --overwrite." % e
 
 if __name__ == "__main__":
-  ConsoleMain()
+  flags.StartMain(main)

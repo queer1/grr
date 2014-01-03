@@ -7,20 +7,22 @@ import threading
 import urllib
 from wsgiref import simple_server
 
+# pylint: disable=unused-import
 
-# pylint: disable=unused-import,g-bad-import-order
+# pylint: disable=g-bad-import-order
 from grr.gui import admin_ui
-# pylint: enable=unused-import,g-bad-import-order
-
-from django.core.handlers import wsgi
+from grr.gui import django_lib
+# pylint: enable=g-bad-import-order
 
 import logging
 
 from grr.lib import access_control
+from grr.lib import aff4
 from grr.lib import config_lib
 from grr.lib import data_store
 from grr.lib import flags
 from grr.lib import ipshell
+from grr.lib import rdfvalue
 from grr.lib import registry
 from grr.lib import startup
 from grr.lib import test_lib
@@ -43,7 +45,7 @@ class DjangoThread(threading.Thread):
     try:
       # Make a simple reference implementation WSGI server
       server = simple_server.make_server("0.0.0.0", port,
-                                         wsgi.WSGIHandler())
+                                         django_lib.GetWSGIHandler())
     except socket.error as e:
       raise socket.error(
           "Error while listening on port %d: %s." % (port, str(e)))
@@ -53,8 +55,12 @@ class DjangoThread(threading.Thread):
 
   def Stop(self):
     self.keep_running = False
-    # Force a request so the socket leaves accept()
-    urllib.urlopen(self.base_url + "/quitmenow").read()
+    try:
+      # Force a request so the socket leaves accept()
+      urllib.urlopen(self.base_url + "/quitmenow").read()
+    except IOError:
+      pass
+
     self.join()
 
 
@@ -72,8 +78,9 @@ class RunTestsInit(registry.InitHook):
     # Install the mock security manager so we can trap errors in interactive
     # mode.
     data_store.DB.security_manager = test_lib.MockSecurityManager()
-    self.token = access_control.ACLToken("Test", "Make fixtures.")
-    self.token.supervisor = True
+    self.token = access_control.ACLToken(username="Test",
+                                         reason="Make fixtures.")
+    self.token = self.token.SetUID()
 
     if data_store.DB.__class__.__name__ == "FakeDataStore":
       self.RestoreFixtureFromCache()
@@ -107,9 +114,9 @@ class TestPluginInit(registry.InitHook):
   pre = ["DjangoInit"]
 
   def RunOnce(self):
-    # pylint: disable=unused-variable,C6204
+    # pylint: disable=unused-variable,g-import-not-at-top
     from grr.gui.plugins import tests
-    # pylint: enable=unused-variable,C6204
+    # pylint: enable=unused-variable,g-import-not-at-top
 
 
 def main(_):
@@ -124,12 +131,7 @@ def main(_):
 
   # This is a standalone program and might need to use the config
   # file.
-  startup.Init()
-
-  # Tests must be imported after django is initialized.
-  # pylint: disable=g-import-not-at-top,unused-variable
-  from grr.gui.plugins import tests
-  # pylint: enable=g-import-not-at-top,unused-variable
+  startup.TestInit()
 
   # Start up a server in another thread
   trd = DjangoThread()

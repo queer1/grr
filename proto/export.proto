@@ -7,6 +7,29 @@ import "grr/proto/sysinfo.proto";
 import "grr/proto/semantic.proto";
 
 
+message ExportOptions {
+  optional bool export_files_contents = 1 [ default = false, (sem_type) = {
+      description: "If this is true, open files and export their full or "
+      "partial contents. Note: this may require additional datastore "
+      "roundtrips and slow down the export process, also exporting file "
+      "contents may significantly increase size of the exported data."
+    }];
+  optional bool follow_urns = 2 [ default = false, (sem_type) = {
+      description: "If this is true, follow urns and try to export not only "
+      "the urns themselves, but also the data they are pointing to. Note: "
+      "this may require additional datastore roundtrips and slow down the "
+      "export process."
+    }];
+  optional bool export_files_hashes = 3 [ default = false, (sem_type) = {
+      description: "If this is true, export hashes when dealing with "
+      "file-related values. The files are not gonna be hashed during the "
+      "export, hashes will only be exported if they were collected before "
+      "the export. This option affects exporting VFSFile and StatEntry "
+      "RDFValues. Note: setting this option to true may require additional "
+      "datastore roundtrips and slow down the export process."
+    }];
+}
+
 message ExportedMetadata {
   optional string client_urn = 1 [(sem_type) = {
       type: "ClientURN",
@@ -28,10 +51,37 @@ message ExportedMetadata {
       type: "RDFDatetime",
       description: "When metadata were recorded."
     }];
-  optional string session_id = 11 [(sem_type) = {
+
+  // BEGIN DEPRECATED
+  optional string deprecated_session_id = 11 [(sem_type) = {
       type: "SessionID",
       description: "Session id of a hunt that collected the data."
+    }, deprecated=true];
+  // END_DEPRECATED
+
+  optional string labels = 12 [(sem_type) = {
+      description: "CSV list of client labels."
     }];
+
+  optional string source_urn = 13 [(sem_type) = {
+      type: "RDFURN",
+      description: "URN of a source of exported data."
+    }];
+}
+
+
+message ExportedClient {
+  optional ExportedMetadata metadata = 1;
+}
+
+
+message ExportedNetworkInterface {
+  optional ExportedMetadata metadata = 1;
+
+  optional string mac_address = 2;
+  optional string ifname = 3;
+  optional string ip4_addresses = 4;
+  optional string ip6_addresses = 5;
 }
 
 message ExportedFile {
@@ -46,7 +96,7 @@ message ExportedFile {
       description: "Basename of the file."
     }];
 
-  optional uint32 st_mode = 4 [(sem_type) = {
+  optional uint64 st_mode = 4 [(sem_type) = {
       type: "StatMode",
       description: "A unix file permission mode."
     }];
@@ -77,12 +127,26 @@ message ExportedFile {
   optional uint32 st_rdev = 16;
   optional string symlink = 17;
 
-  optional string content = 18;  // Actual content of the file if available.
+  optional bytes content = 18;  // Actual content of the file if available.
   optional string content_sha256 = 19;  // sha256 of content.
+
   // client reported values for the hashes
   optional string hash_md5 = 20;
   optional string hash_sha1 = 21;
   optional string hash_sha256 = 22;
+
+  // pecoff hashes
+  optional string pecoff_hash_md5 = 23;
+  optional string pecoff_hash_sha1 = 24;
+
+  // certificates data
+  optional string cert_hasher_name = 25;
+  optional string cert_program_name = 26;
+  optional string cert_program_url = 27;
+  optional string cert_signing_id = 28;
+  optional string cert_chain_head_issuer = 29;
+  optional string cert_countersignature_chain_head_issuer = 30;
+  optional string cert_certificates = 31;
 }
 
 message ExportedRegistryKey {
@@ -169,4 +233,15 @@ message ExportedVolatilityMutant {
   optional uint64 thread = 6;
   optional string cid = 7; // 12345678:123
   optional string name = 8; // named object, eg: XYZLock
+}
+
+message ExportedFileStoreHash {
+  optional ExportedMetadata metadata = 1;
+
+  optional string hash = 2;
+  optional string hash_type = 3;
+  optional string fingerprint_type = 4;
+  optional string target_urn = 5 [(sem_type) = {
+      type: "RDFURN",
+    }];
 }

@@ -11,24 +11,6 @@ import logging
 from grr.lib import config_lib
 from grr.lib import registry
 
-config_lib.DEFINE_string(
-    "AdminUI.webauth_manager", "NullWebAuthManager",
-    "The web auth manager for controlling access to the UI.")
-
-config_lib.DEFINE_bool("AdminUI.django_debug", True,
-                       "Turn on to add django debugging")
-
-config_lib.DEFINE_list(
-    "AdminUI.django_allowed_hosts", ["*"],
-    "Set the django ALLOWED_HOSTS parameter. "
-    "See https://docs.djangoproject.com/en/1.5/ref/settings/#allowed-hosts")
-
-
-config_lib.DEFINE_string(
-    "AdminUI.django_secret_key", "CHANGE_ME",
-    "This is a secret key that should be set in the server "
-    "config. It is used in XSRF and session protection.")
-
 
 class DjangoInit(registry.InitHook):
   """Initialize the Django environment."""
@@ -74,6 +56,11 @@ class GuiPluginsInit(registry.InitHook):
 
   def RunOnce(self):
     """Import the plugins once only."""
-    # pylint: disable=unused-variable,C6204
+    # pylint: disable=unused-variable,g-import-not-at-top
     from grr.gui import gui_plugins
-    # pylint: enable=unused-variable,C6204
+    # pylint: enable=unused-variable,g-import-not-at-top
+
+
+def GetWSGIHandler():
+  from django.core.handlers import wsgi  # pylint: disable=g-import-not-at-top
+  return wsgi.WSGIHandler()

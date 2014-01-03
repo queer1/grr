@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
 """AFF4 RDFValue implementations for client information.
 
 This module contains the RDFValue implementations used to communicate with the
@@ -10,17 +9,17 @@ from hashlib import sha256
 
 import re
 import socket
-import sys
+import stat
 
 from grr.lib import rdfvalue
 from grr.lib import type_info
 from grr.lib import utils
 
-from grr.lib.rdfvalues import paths
 from grr.lib.rdfvalues import protodict
 from grr.lib.rdfvalues import standard
 from grr.lib.rdfvalues import structs
 
+from grr.proto import flows_pb2
 from grr.proto import jobs_pb2
 from grr.proto import knowledge_base_pb2
 from grr.proto import sysinfo_pb2
@@ -32,20 +31,6 @@ class ClientURN(rdfvalue.RDFURN):
   # Valid client urns must match this expression.
   CLIENT_ID_RE = re.compile(r"^(aff4:/)?C\.[0-9a-fA-F]{16}$")
 
-  def __init__(self, initializer=None, age=None):
-    """Constructor.
-
-    Args:
-      initializer: A string or another RDFURN.
-      age: The age of this entry.
-    """
-    # If we are initialized from another URN we need to validate it.
-    if isinstance(initializer, rdfvalue.RDFURN):
-      self.ParseFromString(initializer.SerializeToString())
-      super(ClientURN, self).__init__(initializer=None, age=age)
-    else:
-      super(ClientURN, self).__init__(initializer=initializer, age=age)
-
   def ParseFromString(self, value):
     if not self.Validate(value):
       raise type_info.TypeValueError("Client urn malformed: %s" % value)
@@ -54,10 +39,10 @@ class ClientURN(rdfvalue.RDFURN):
 
   @classmethod
   def Validate(cls, value):
-    if not value:
-      return True
+    if value:
+      return bool(cls.CLIENT_ID_RE.match(str(value)))
 
-    return bool(cls.CLIENT_ID_RE.match(str(value)))
+    return False
 
   @classmethod
   def FromPublicKey(cls, public_key):
@@ -88,6 +73,10 @@ class ClientURN(rdfvalue.RDFURN):
     result.Update(path=utils.JoinPath(self._urn.path, path))
 
     return result
+
+  def Queue(self):
+    """Returns the queue name of this clients task queue."""
+    return self.Add("tasks")
 
 
 # These are objects we store as attributes of the client.
@@ -123,7 +112,35 @@ class User(rdfvalue.RDFProtoStruct):
 
   This stores information related to a specific user of the client system.
   """
-  protobuf = jobs_pb2.UserAccount
+  protobuf = jobs_pb2.User
+
+  kb_user_mapping = {
+      "username": "username",
+      "domain": "userdomain",
+      "homedir": "homedir",
+      "sid": "sid",
+      "special_folders.cookies": "cookies",
+      "special_folders.local_settings": "local_settings",
+      "special_folders.local_app_data": "localappdata",
+      "special_folders.app_data": "appdata",
+      "special_folders.cache": "internet_cache",
+      "special_folders.personal": "personal",
+      "special_folders.desktop": "desktop",
+      "special_folders.startup": "startup",
+      "special_folders.recent": "recent",
+  }
+
+  def ToKnowledgeBaseUser(self):
+    """Convert a User value into a KnowledgeBaseUser value."""
+    kb_user = rdfvalue.KnowledgeBaseUser()
+    for old_pb_name, new_pb_name in self.kb_user_mapping.items():
+      if len(old_pb_name.split(".")) > 1:
+        attr, old_pb_name = old_pb_name.split(".", 1)
+        val = getattr(getattr(self, attr), old_pb_name)
+      else:
+        val = getattr(self, old_pb_name)
+      kb_user.Set(new_pb_name, val)
+    return kb_user
 
 
 class Users(protodict.RDFValueArray):
@@ -134,6 +151,52 @@ class Users(protodict.RDFValueArray):
 class KnowledgeBase(rdfvalue.RDFProtoStruct):
   """Information about the system and users."""
   protobuf = knowledge_base_pb2.KnowledgeBase
+
+  def MergeOrAddUser(self, kb_user):
+    """Merge a user into existing users or add new if it doesn't exist.
+
+    Args:
+      kb_user: A KnowledgeBaseUser rdfvalue.
+
+    Returns:
+      A list of strings with the set attribute names, e.g. ["users.sid"]
+    """
+    user = self.GetUser(sid=kb_user.sid, uid=kb_user.uid,
+                        username=kb_user.username)
+    new_attrs = []
+    merge_conflicts = []    # Record when we overwrite a value.
+    if not user:
+      self.users.Append(kb_user)
+      new_attrs = ["users.%s" % k for k in kb_user.AsDict().keys()]
+    else:
+      for key, val in kb_user.AsDict().items():
+        if user.Get(key) and user.Get(key) != val:
+          merge_conflicts.append((key, user.Get(key), val))
+        user.Set(key, val)
+        new_attrs.append("users.%s" % key)
+
+    return new_attrs, merge_conflicts
+
+  def GetUser(self, sid=None, uid=None, username=None):
+    """Retrieve a KnowledgeBaseUser based on sid, uid or username."""
+    if sid:
+      for user in self.users:
+        if user.sid == sid:
+          return user
+    if uid:
+      for user in self.users:
+        if user.uid == uid:
+          return user
+    if username:
+      for user in self.users:
+        if user.username == username:
+          return user
+
+  def GetKbFieldNames(self):
+    fields = self.type_infos.descriptor_names
+    for field in self.users.type_descriptor.type.type_infos.descriptor_names:
+      fields.append("users.%s" % field)
+    return fields
 
 
 class KnowledgeBaseUser(rdfvalue.RDFProtoStruct):
@@ -159,14 +222,26 @@ class NetworkAddress(rdfvalue.RDFProtoStruct):
   """A network address."""
   protobuf = jobs_pb2.NetworkAddress
 
-  def HumanReadableAddress(self):
+  @property
+  def human_readable_address(self):
     if self.human_readable:
       return self.human_readable
     else:
-      if self.address_type == rdfvalue.NetworkAddress.Enum("INET"):
-        return socket.inet_ntop(socket.AF_INET, self.packed_bytes)
-      else:
-        return socket.inet_ntop(socket.AF_INET6, self.packed_bytes)
+      try:
+        if self.address_type == rdfvalue.NetworkAddress.Family.INET:
+          return socket.inet_ntop(socket.AF_INET, self.packed_bytes)
+        else:
+          return socket.inet_ntop(socket.AF_INET6, self.packed_bytes)
+      except ValueError as e:
+        return str(e)
+
+
+class MacAddress(rdfvalue.RDFBytes):
+  """A MAC address."""
+
+  @property
+  def human_readable_address(self):
+    return self._value.encode("hex")
 
 
 class Interface(rdfvalue.RDFProtoStruct):
@@ -180,7 +255,7 @@ class Interface(rdfvalue.RDFProtoStruct):
       if address.human_readable:
         results.append(address.human_readable)
       else:
-        if address.address_type == rdfvalue.NetworkAddress.Enum("INET"):
+        if address.address_type == rdfvalue.NetworkAddress.Family.INET:
           results.append(socket.inet_ntop(socket.AF_INET,
                                           address.packed_bytes))
         else:
@@ -308,7 +383,7 @@ class DriverInstallTemplate(rdfvalue.RDFProtoStruct):
 
   This is sent to the client to instruct the client how to install this driver.
   """
-  protobuf = jobs_pb2.InstallDriverRequest
+  protobuf = jobs_pb2.DriverInstallTemplate
 
 
 class BufferReference(rdfvalue.RDFProtoStruct):
@@ -324,11 +399,6 @@ class Process(rdfvalue.RDFProtoStruct):
   protobuf = sysinfo_pb2.Process
 
 
-class Processes(protodict.RDFValueArray):
-  """A list of processes on the system."""
-  rdf_type = Process
-
-
 class SoftwarePackage(rdfvalue.RDFProtoStruct):
   """Represent an installed package on the client."""
   protobuf = sysinfo_pb2.SoftwarePackage
@@ -341,22 +411,54 @@ class SoftwarePackages(protodict.RDFValueArray):
 
 class StatMode(rdfvalue.RDFInteger):
   """The mode of a file."""
+  data_store_type = "unsigned_integer"
 
   def __unicode__(self):
     """Pretty print the file mode."""
+    type_char = "-"
+
+    mode = int(self)
+    if stat.S_ISREG(mode):
+      type_char = "-"
+    elif stat.S_ISBLK(mode):
+      type_char = "b"
+    elif stat.S_ISCHR(mode):
+      type_char = "c"
+    elif stat.S_ISDIR(mode):
+      type_char = "d"
+    elif stat.S_ISFIFO(mode):
+      type_char = "f"
+    elif stat.S_ISLNK(mode):
+      type_char = "l"
+    elif stat.S_ISSOCK(mode):
+      type_char = "s"
+
     mode_template = "rwx" * 3
-    mode = bin(int(self))[-9:]
+    # Strip the "0b"
+    bin_mode = bin(int(self))[2:]
+    bin_mode = bin_mode[-9:]
+    bin_mode = "0" * (9-len(bin_mode)) + bin_mode
 
     bits = []
     for i in range(len(mode_template)):
-      if mode[i] == "1":
+      if bin_mode[i] == "1":
         bit = mode_template[i]
       else:
         bit = "-"
 
       bits.append(bit)
 
-    return "".join(bits)
+    if stat.S_ISUID & mode:
+      bits[2] = "S"
+    if stat.S_ISGID & mode:
+      bits[5] = "S"
+    if stat.S_ISVTX & mode:
+      if bits[8] == "x":
+        bits[8] = "t"
+      else:
+        bits[8] = "T"
+
+    return type_char + "".join(bits)
 
 
 class Iterator(rdfvalue.RDFProtoStruct):
@@ -369,11 +471,23 @@ class StatEntry(rdfvalue.RDFProtoStruct):
   protobuf = jobs_pb2.StatEntry
 
 
-class RDFFindSpec(rdfvalue.RDFProtoStruct):
+class FindSpec(rdfvalue.RDFProtoStruct):
   """A find specification."""
-  protobuf = jobs_pb2.Find
+  protobuf = jobs_pb2.FindSpec
 
   dependencies = dict(RegularExpression=standard.RegularExpression)
+
+  def Validate(self):
+    """Ensure the pathspec is valid."""
+    self.pathspec.Validate()
+
+    if (self.HasField("start_time") and self.HasField("end_time") and
+        self.start_time > self.end_time):
+      raise ValueError("Start time must be before end time.")
+
+    if not self.path_regex and not self.data_regex and not self.path_glob:
+      raise ValueError("A Find specification can not contain both an empty "
+                       "path regex and an empty data regex")
 
 
 class LogMessage(rdfvalue.RDFProtoStruct):
@@ -424,6 +538,12 @@ class StartupInfo(rdfvalue.RDFProtoStruct):
 class SendFileRequest(rdfvalue.RDFProtoStruct):
   protobuf = jobs_pb2.SendFileRequest
 
+  def Validate(self):
+    self.pathspec.Validate()
+
+    if not self.host:
+      raise ValueError("A host must be specified.")
+
 
 class ListDirRequest(rdfvalue.RDFProtoStruct):
   protobuf = jobs_pb2.ListDirRequest
@@ -453,6 +573,14 @@ class FingerprintResponse(rdfvalue.RDFProtoStruct):
 
 class GrepSpec(rdfvalue.RDFProtoStruct):
   protobuf = jobs_pb2.GrepSpec
+
+  def Validate(self):
+    self.target.Validate()
+
+
+class BareGrepSpec(rdfvalue.RDFProtoStruct):
+  """A GrepSpec without a target."""
+  protobuf = flows_pb2.BareGrepSpec
 
 
 class WMIRequest(rdfvalue.RDFProtoStruct):
@@ -520,112 +648,6 @@ class ClientCrash(rdfvalue.RDFProtoStruct):
   protobuf = jobs_pb2.ClientCrash
 
 
-class NoTargetGrepspecType(type_info.RDFValueType):
-  """A Grep spec with no target."""
-
-  child_descriptor = type_info.TypeDescriptorSet(
-      type_info.String(
-          description="Search for this regular expression.",
-          name="regex",
-          friendly_name="Regular Expression",
-          default=""),
-      type_info.Bytes(
-          description="Search for this literal expression.",
-          name="literal",
-          friendly_name="Literal Match",
-          default=""),
-      type_info.Integer(
-          description="Offset to start searching from.",
-          name="start_offset",
-          friendly_name="Start",
-          default=0),
-      type_info.Integer(
-          description="Length to search.",
-          name="length",
-          friendly_name="Length",
-          default=10737418240),
-      type_info.SemanticEnum(
-          description="How many results should be returned?",
-          name="mode",
-          friendly_name="Search Mode",
-          enum_container=rdfvalue.GrepSpec.Mode),
-      type_info.Integer(
-          description="Snippet returns these many bytes before the hit.",
-          name="bytes_before",
-          friendly_name="Bytes Before",
-          default=0),
-      type_info.Integer(
-          description="Snippet returns these many bytes after the hit.",
-          name="bytes_after",
-          friendly_name="Bytes After",
-          default=0),
-      )
-
-  def __init__(self, **kwargs):
-    defaults = dict(name="grepspec",
-                    rdfclass=rdfvalue.GrepSpec)
-
-    defaults.update(kwargs)
-    super(NoTargetGrepspecType, self).__init__(**defaults)
-
-
-class GrepspecType(NoTargetGrepspecType):
-  """A Type for handling Grep specifications."""
-
-  child_descriptor = (
-      NoTargetGrepspecType.child_descriptor +
-      type_info.TypeDescriptorSet(
-          paths.PathspecType(name="target")
-          )
-      )
-
-  def Validate(self, value):
-    if value.target.pathtype < 0:
-      raise type_info.TypeValueError("GrepSpec has an invalid target PathSpec.")
-
-    return super(GrepspecType, self).Validate(value)
-
-
-class FindSpecType(type_info.RDFValueType):
-  """A Find spec type."""
-
-  child_descriptor = type_info.TypeDescriptorSet(
-      paths.PathspecType(),
-      type_info.String(
-          description="Search for this regular expression.",
-          name="path_regex",
-          friendly_name="Path Regular Expression",
-          default=""),
-      type_info.String(
-          description="Search for this regular expression in the data.",
-          name="data_regex",
-          friendly_name="Data Regular Expression",
-          default=""),
-      type_info.Bool(
-          description="Should we cross devices?",
-          name="cross_devs",
-          friendly_name="Cross Devices",
-          default=False),
-      type_info.Integer(
-          description="Maximum recursion depth.",
-          name="max_depth",
-          friendly_name="Depth",
-          default=5),
-      type_info.Integer(
-          description="Minimum file size in bytes.",
-          name="min_file_size",
-          friendly_name="Minimum File Size (Bytes)",
-          default=0),
-      type_info.Integer(
-          description="Maximum file size in bytes.",
-          name="max_file_size",
-          friendly_name="Maximum File Size (Bytes)",
-          default=sys.maxint),
-      )
-
-  def __init__(self, **kwargs):
-    defaults = dict(name="findspec",
-                    rdfclass=rdfvalue.RDFFindSpec)
-
-    defaults.update(kwargs)
-    super(FindSpecType, self).__init__(**defaults)
+class ClientSummary(rdfvalue.RDFProtoStruct):
+  """Object containing client's summary data."""
+  protobuf = jobs_pb2.ClientSummary

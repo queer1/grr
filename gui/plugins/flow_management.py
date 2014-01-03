@@ -3,27 +3,23 @@
 
 """GUI elements allowing launching and management of flows."""
 
-
+import os
 import StringIO
 import urllib
 
 
-import matplotlib
-# We need to select a non interactive backend for matplotlib.
-matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-import matplotlib.pyplot as plt  # pylint: disable-msg=g-import-not-at-top
-
-import logging
 from grr.gui import renderers
 from grr.gui.plugins import crash_view
 from grr.gui.plugins import fileview
+from grr.gui.plugins import forms
+from grr.gui.plugins import semantic
 from grr.lib import aff4
 from grr.lib import data_store
 from grr.lib import flow
-from grr.lib import flow_runner
+from grr.lib import queue_manager
 from grr.lib import rdfvalue
-from grr.lib import type_info
 from grr.lib import utils
 
 
@@ -34,7 +30,7 @@ class LaunchFlows(renderers.Splitter):
   order = 10
 
   left_renderer = "FlowTree"
-  top_right_renderer = "FlowForm"
+  top_right_renderer = "SemanticProtoFlowForm"
   bottom_right_renderer = "FlowManagementTabs"
 
 
@@ -42,13 +38,17 @@ class FlowTree(renderers.TreeRenderer):
   """Show all flows in a tree.
 
   Generated Javascript Events:
-    - flow_select(flow_name) - The full path for the flow name (category +
+    - flow_select(flow_path) - The full path for the flow name (category +
       name).
   """
 
   publish_select_queue = "flow_select"
 
-  def EnumerateCategories(self, path, request):
+  # Only show flows in the tree that specify all of these behaviours in their
+  # behaviours attribute.
+  flow_behaviors_to_render = flow.FlowBehaviour("Client Flow")
+
+  def EnumerateCategories(self, path, request, flow_behaviors_to_render):
     """Search through all flows for categories starting with path."""
     categories = set()
     flows = set()
@@ -56,16 +56,24 @@ class FlowTree(renderers.TreeRenderer):
     path = rdfvalue.RDFURN(path)
 
     for name, cls in flow.GRRFlow.classes.items():
-      if not hasattr(cls, "category") or not cls.category:
+      # Flows without a category do not show up in the GUI.
+      if not getattr(cls, "category", None):
         continue
+
+      # If a flow is tagged as AUTHORIZED_LABELS, the user must have the correct
+      # label to see it.
       if cls.AUTHORIZED_LABELS:
         if not data_store.DB.security_manager.CheckUserLabels(
-            request.token.username, cls.AUTHORIZED_LABELS):
+            request.token.username, cls.AUTHORIZED_LABELS, token=request.token):
           continue
+
+      # Skip if there are behaviours that are not supported by the class.
+      if not flow_behaviors_to_render.IsSupported(cls.behaviours):
+        continue
 
       category = rdfvalue.RDFURN(cls.category)
       if category == path:
-        flows.add(name)
+        flows.add((name, cls.friendly_name))
       else:
         relative_path = category.RelativeName(path)
         # This category starts with this path
@@ -76,12 +84,26 @@ class FlowTree(renderers.TreeRenderer):
 
   def RenderBranch(self, path, request):
     """Renders tree leafs for flows."""
-    categories, flows = self.EnumerateCategories(path, request)
+    # Retrieve the user's GUI mode preferences.
+    self.user = request.user
+    try:
+      user_record = aff4.FACTORY.Open(
+          aff4.ROOT_URN.Add("users").Add(self.user), "GRRUser",
+          token=request.token)
+
+      user_preferences = user_record.Get(user_record.Schema.GUI_SETTINGS)
+    except IOError:
+      user_preferences = aff4.GRRUser.SchemaCls.GUI_SETTINGS()
+
+    flow_behaviors_to_render = (self.flow_behaviors_to_render +
+                                user_preferences.mode)
+    categories, flows = self.EnumerateCategories(path, request,
+                                                 flow_behaviors_to_render)
     for category in sorted(categories):
       self.AddElement(category)
 
-    for f in sorted(flows):
-      self.AddElement(f, "leaf")
+    for name, friendly_name in sorted(flows):
+      self.AddElement(name, behaviour="leaf", friendly_name=friendly_name)
 
 
 class FlowManagementTabs(renderers.TabLayout):
@@ -182,10 +204,9 @@ Prototype: {{ this.prototype|escape }}
 
     # Now fill in information about each arg to this flow.
     prototypes = []
-    for type_descriptor in flow_class.flow_typeinfo:
+    for type_descriptor in flow_class.args_type.type_infos:
       if not type_descriptor.hidden:
-        prototypes.append("%s %s" % (type_descriptor.__class__.__name__,
-                                     type_descriptor.name))
+        prototypes.append("%s" % (type_descriptor.name))
 
     self.prototype = "%s(%s)" % (flow_class.__name__, ", ".join(prototypes))
 
@@ -194,216 +215,136 @@ Prototype: {{ this.prototype|escape }}
     return super(FlowInformation, self).Layout(request, response)
 
 
-class FlowForm(FlowInformation):
-  """Construct a form to launch the Flow.
-
-  Listening Javascript Events:
-    - flow_select(flow_path) - A new path was selected in the tree and we
-      rerender ourselves to make a new form.
-  """
-
-  # Prefix to use in form elements' names
-  prefix = "v_"
-
-  # Ignore flow argumentes with given names
-  ignore_flow_args = []
+class SemanticProtoFlowForm(renderers.TemplateRenderer):
+  """Render a flow based on its semantic information."""
 
   layout_template = renderers.Template("""
-<div class="FormBody" id="FormBody_{{unique|escape}}">
-<form id='form_{{unique|escape}}' method='POST' class="form-horizontal">
-{% if this.flow_name %}
-  <input type=hidden name='FlowName' value='{{ this.flow_name|escape }}'/>
-  <div class="control-group">
-    <label class="control-label">Client ID</label>
-    <div class="controls">
-      <span class="uneditable-input" id="client_id_{{unique|escape}}">
-        {{this.client_id|escape}}
-      </span>
-    </div>
-  </div>
+<div class="FormBody" id="{{unique|escape}}">
+{% if this.flow_found %}
+  <form id='form_{{unique|escape}}' class="form-horizontal FormData"
+    data-flow_path='{{this.flow_name|escape}}'
+    data-dom_node='{{id|escape}}'
+    >
 
-  {{this.flow_args|safe}}
+    {{this.form|safe}}
+    <hr/>
+    {{this.runner_form|safe}}
 
-  <div class="control-group">
-    <div class="controls">
-      <input id='submit_{{unique|escape}}' type="submit" class="btn btn-success"
-        value="Launch"/>
+    <div class="control-group">
+      <div class="controls">
+        <button id='submit_{{unique|escape}}' class="btn btn-success Launch" >
+          Launch
+        </button>
+      </div>
     </div>
-  </div>
+  </form>
+{% else %}
+Please Select a flow to launch from the tree on the left.
 {% endif %}
-</form>
 </div>
+
+<div id="contents_{{unique}}"></div>
 <script>
   $("#submit_{{unique|escapejs}}").click(function () {
-      return grr.submit('FlowFormAction', 'form_{{unique|escapejs}}',
-                        '{{id|escapejs}}', false);
+      var state = {};
+      $.extend(state, $('#form_{{unique|escapejs}}').data(), grr.state);
+
+      grr.update('{{renderer}}', 'contents_{{unique|escapejs}}',
+                 state);
+
+      return false;
     });
 
   grr.subscribe('flow_select', function(path) {
      grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}", {
-       flow_name: path,
+       flow_path: path,
        client_id: grr.state.client_id,
        reason: grr.state.reason
      });
-  }, 'form_{{unique|escapejs}}');
+  }, '{{unique|escapejs}}');
+</script>
+""") + renderers.TemplateRenderer.help_template
 
-  $("input.form_field_or_none").each(function(index) {
-    grr.formNoneHandler($(this));
-  });
+  ajax_template = renderers.Template("""
+<pre>
+{{this.args}}
+</pre>
+<pre>
+{{this.runner_args}}
+</pre>
 
-  // Fixup checkboxes so they return values even if unchecked.
-  $(".FormBody").find("input[type=checkbox]").change(function() {
-    $(this).attr("value", $(this).attr("checked") ? "True" : "False");
-  });
+Launched Flow {{this.flow_name}}.
 
+<script>
+  $("#{{this.dom_node|escapejs}} .FormBody").html("");
+
+  grr.subscribe('flow_select', function(path) {
+     grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}", {
+       flow_path: path,
+       client_id: grr.state.client_id,
+       reason: grr.state.reason
+     });
+  }, '{{unique|escapejs}}');
 </script>
 """)
 
-  def Layout(self, request, response):
-    """Update the form from the tree selection."""
-    self.flow_name = request.REQ.get("flow_name", "").split("/")[-1]
-    self.client_id = request.REQ.get("client_id", "")
-    self.client = aff4.FACTORY.Open(self.client_id, token=request.token)
-
-    type_descriptor_renderer = renderers.TypeDescriptorSetRenderer()
-
-    # Fill in the form elements
-    if self.flow_name in flow.GRRFlow.classes:
-      flow_class = flow.GRRFlow.classes[self.flow_name]
-      if aff4.issubclass(flow_class, flow.GRRFlow):
-        flow_typeinfo = flow_class.flow_typeinfo
-
-        # Merge standard flow args if needed
-        if flow_typeinfo is not flow.GRRFlow.flow_typeinfo:
-          flow_typeinfo = flow_typeinfo.Add(flow.GRRFlow.flow_typeinfo)
-
-        # Filter out ignored args so that they do not get rendered
-        flow_typeinfo = flow_typeinfo.Remove(
-            *[arg for arg in self.ignore_flow_args
-              if flow_typeinfo.HasDescriptor(arg)])
-
-        self.flow_args = type_descriptor_renderer.Form(
-            flow_typeinfo, request, prefix=self.prefix)
-
-    return renderers.TemplateRenderer.Layout(self, request, response)
-
-
-class FlowFormAction(FlowInformation):
-  """Execute a flow and show status."""
-
-  buttons = """
-<form id='form_{{unique|escape}}'>
-  <input type=hidden name='flow_name' value='{{this.flow_name|escape}}' />
-{% for desc, value in args_sent %}
-  <input type=hidden name='{{arg_prefix|escape}}{{ desc|escape }}'
-   value='{{ value|escape }}'/>
-{% endfor %}
-
-<input id='submit' type="submit" value="Back" class="btn" />
-<input id='gotoflow' type='submit' value='View' class="btn" />
-</form>
+  ajax_error_template = renderers.Template("""
 <script>
-  $("#submit").button()
-    .click(function () {
-      return grr.submit('FlowForm', 'form_{{unique|escapejs}}',
-                        '{{id|escapejs}}', false);
-    });
-
-  $('#gotoflow').button().click(function () {
-      grr.publish('hash_state', 'flow', '{{this.flow_id|escapejs}}');
-      grr.publish('hash_state', 'main', 'ManageFlows');
-      grr.loadFromHash();
-  });
-
-  grr.subscribe('flow_select', function(path) {
-     grr.layout("FlowForm", "{{id|escapejs}}", {
-       flow_name: path,
-       client_id: grr.state.client_id,
-       reason: grr.state.reason
-     });
-  }, 'form_{{unique|escapejs}}');
+grr.publish("grr_messages", "{{error|escapejs}}");
+grr.publish("grr_traceback", "{{error|escapejs}}");
 </script>
-"""
+""")
 
-  hide_view_button = """
-<script>
-$('#gotoflow').hide();
-</script>
-"""
-
-  layout_template = renderers.Template("""
-<div class="fill-parent no-top-margin">
-<h3>Launched flow {{this.flow_name|escape}}</h3>
-<p><small>{{this.flow_id|escape}}</small></p>
-<dl class="dl-horizontal">
-  <dt>client_id</dt>
-  <dd>'{{ this.client_id|escape }}'</dd>
-{% for desc, arg in this.args_sent %}
-  <dt>{{ desc|escape }}</dt>
-  <dd>{{ arg|escape }}</dd>
-{% endfor %}
-</dl>
-<div class='button_row'>
-""" + buttons + "</div>")
-
-  error_template = renderers.Template("""
-<h2>Error: Flow '{{ name|escape }}' : </h2> {{ error|escape }}
-""" + buttons + hide_view_button)
+  context_help_url = "user_manual.html#_flows"
 
   def Layout(self, request, response):
-    """Launch the flow."""
-    req = request.REQ
-    self.flow_name = req.get("FlowName")
+    """Render the form for creating the flow args."""
+    self.flow_name = os.path.basename(request.REQ.get("flow_path", ""))
+    self.flow_cls = flow.GRRFlow.classes.get(self.flow_name)
+    if aff4.issubclass(self.flow_cls, flow.GRRFlow):
+      self.flow_found = True
 
-    try:
-      flow_class = flow.GRRFlow.classes[self.flow_name]
-    except KeyError:
-      return self.RenderFromTemplate(self.error_template, response,
-                                     error="Flow not found",
-                                     name=self.flow_name,
-                                     this=self)
+      self.form = forms.SemanticProtoFormRenderer(
+          self.flow_cls.GetDefaultArgs(token=request.token),
+          prefix="args").RawHTML(request)
 
-    try:
-      self.client_id = req.get("client_id")
-      if not self.client_id:
-        raise RuntimeError("Client Id Not provided.")
+      self.runner_form = forms.SemanticProtoFormRenderer(
+          flow.FlowRunnerArgs(flow_name=self.flow_name),
+          prefix="runner").RawHTML(request)
 
-      type_descriptor_renderer = renderers.TypeDescriptorSetRenderer()
+    return super(SemanticProtoFlowForm, self).Layout(request, response)
 
-      # We need to be careful here as an attacker controls flow name and
-      # arguments. Make sure to append the token and event_id as keyword
-      # arguments to the constructor - this will raise if a non-flow reference
-      # happened to make its way here, and is thus more defensive.
-      self.args = dict(type_descriptor_renderer.ParseArgs(
-          flow_class.flow_typeinfo, request))
+  def RenderAjax(self, request, response):
+    """Parse the flow args from the form and launch the flow."""
+    self.flow_name = request.REQ.get("flow_path", "").split("/")[-1]
+    self.client_id = request.REQ.get("client_id", None)
+    self.dom_node = request.REQ.get("dom_node")
 
-      # Also parse standard flow parameters like priority and notify_to_user.
-      if flow_class.flow_typeinfo != flow.GRRFlow.flow_typeinfo:
-        self.args.update(dict(type_descriptor_renderer.ParseArgs(
-            flow.GRRFlow.flow_typeinfo, request)))
+    flow_cls = flow.GRRFlow.classes.get(self.flow_name)
+    if flow_cls is not None:
 
-      self.args["event_id"] = request.event_id
+      self.args = forms.SemanticProtoFormRenderer(
+          flow_cls.args_type(), prefix="args").ParseArgs(request)
 
-      self.args_sent = []
-      for (k, v) in self.args.items():
-        value = utils.SmartUnicode(v)
-        if v:
-          value = "'" + value + "'"
-        self.args_sent.append((utils.SmartUnicode(k), value))
+      try:
+        self.args.Validate()
+      except ValueError as e:
+        return self.RenderFromTemplate(self.ajax_error_template,
+                                       response, error=e)
 
-      self.flow_id = flow.GRRFlow.StartFlow(self.client_id, self.flow_name,
-                                            token=request.token, **self.args)
+      self.runner_args = forms.SemanticProtoFormRenderer(
+          flow.FlowRunnerArgs(), prefix="runner_").ParseArgs(request)
 
-      return renderers.TemplateRenderer.Layout(self, request, response)
+      self.runner_args.Validate()
 
-    # Here we catch all exceptions in order to relay potential errors to users
-    # (Otherwise they are just hidden by django error page).
-    except Exception as e:  # pylint: disable=broad-except
-      logging.exception("Error: %s", e)
-      renderers.Renderer.Layout(self, request, response)
-      return self.RenderFromTemplate(
-          self.error_template, response, this=self,
-          error=str(e), id=self.id, name=self.flow_name)
+      self.flow_id = flow.GRRFlow.StartFlow(client_id=self.client_id,
+                                            flow_name=self.flow_name,
+                                            token=request.token,
+                                            args=self.args,
+                                            runner_args=self.runner_args)
+
+    return renderers.TemplateRenderer.Layout(
+        self, request, response, apply_template=self.ajax_template)
 
 
 class FlowFormCancelAction(renderers.TemplateRenderer):
@@ -419,33 +360,37 @@ class FlowFormCancelAction(renderers.TemplateRenderer):
     # it requires writing to the datastore. We're not allowed to do it from
     # the GUI. Therefore we use dedicated TerminateFlow flow.
     flow.GRRFlow.StartFlow(
-        None, "TerminateFlow",
+        flow_name="TerminateFlow",
         flow_urn=rdfvalue.RDFURN(request.REQ.get("flow_id")),
         reason="Cancelled in GUI", token=request.token)
 
     super(FlowFormCancelAction, self).Layout(request, response)
 
 
-class FlowStateIcon(renderers.RDFValueRenderer):
+class FlowStateIcon(semantic.RDFValueRenderer):
   """Render the flow state by using an icon."""
 
   layout_template = renderers.Template("""
 <div class="centered">
   <img class='grr-icon grr-flow-icon'
-    src='/static/images/{{this.icon|escape}}' />
+    src='/static/images/{{this.icon|escape}}'
+    title='{{this.title|escape}}'
+/>
 </div>""")
 
   # Maps the flow states to icons we can show
-  state_map = {"TERMINATED": "stock_yes.png",
-               "RUNNING": "clock.png",
-               "ERROR": "nuke.png",
-               "CLIENT_CRASHED": "skull-icon.png"}
+  state_map = {"TERMINATED": ("stock_yes.png", "Flow finished normally."),
+               "RUNNING": ("clock.png", "Flow is still running."),
+               "ERROR": ("nuke.png", "Flow terminated with an error."),
+               "CLIENT_CRASHED": (
+                   "skull-icon.png",
+                   "The client crashed while executing this flow.")}
 
   icon = "question-red.png"
 
   def Layout(self, request, response):
     try:
-      self.icon = self.state_map[str(self.proxy)]
+      self.icon, self.title = self.state_map[str(self.proxy)]
     except (KeyError, ValueError):
       pass
 
@@ -510,19 +455,22 @@ class FlowRequestView(renderers.TableRenderer):
 
   def __init__(self, **kwargs):
     super(FlowRequestView, self).__init__(**kwargs)
-    self.AddColumn(renderers.RDFValueColumn("ID"))
-    self.AddColumn(renderers.RDFValueColumn("Request", width="100%"))
+    self.AddColumn(semantic.RDFValueColumn("ID"))
+    self.AddColumn(semantic.RDFValueColumn("Request", width="100%"))
+    self.AddColumn(semantic.RDFValueColumn("Last Response", width="100%"))
 
   def BuildTable(self, start_row, end_row, request):
     session_id = request.REQ.get("flow", "")
 
-    state_queue = flow_runner.FlowManager.FLOW_STATE_TEMPLATE % session_id
-    predicate_re = flow_runner.FlowManager.FLOW_REQUEST_PREFIX + ".*"
+    if not session_id:
+      return
 
-    # Get all the responses for this request.
-    for i, (predicate, req_state, _) in enumerate(data_store.DB.ResolveRegex(
-        state_queue, predicate_re, decoder=rdfvalue.RequestState,
-        limit=end_row, token=request.token)):
+    manager = queue_manager.QueueManager(token=request.token)
+    for i, (request, responses) in enumerate(
+        manager.FetchRequestsAndResponses(
+            rdfvalue.RDFURN(session_id))):
+      if request.id == 0:
+        continue
 
       if i < start_row:
         continue
@@ -530,11 +478,14 @@ class FlowRequestView(renderers.TableRenderer):
         break
 
       # Tie up the request to each response to make it easier to render.
-      self.AddCell(i, "ID", predicate)
-      self.AddCell(i, "Request", rdfvalue.RequestState(req_state))
+      self.AddCell(i, "ID",
+                   manager.FLOW_REQUEST_TEMPLATE % request.id)
+      self.AddCell(i, "Request", request)
+      if responses:
+        self.AddCell(i, "Last Response", responses[-1])
 
 
-class TreeColumn(renderers.RDFValueColumn, renderers.TemplateRenderer):
+class TreeColumn(semantic.RDFValueColumn, renderers.TemplateRenderer):
   """A specialized column which adds tree controls."""
 
   template = renderers.Template("""
@@ -562,7 +513,7 @@ class TreeColumn(renderers.RDFValueColumn, renderers.TemplateRenderer):
     renderer = self.renderer
     if renderer is None:
       # What is the RDFValueRenderer for this attribute?
-      renderer = renderers.RDFValueRenderer.RendererForRDFValue(
+      renderer = semantic.RDFValueRenderer.RendererForRDFValue(
           self.value.__class__.__name__)
 
     # Intantiate the renderer and return the HTML
@@ -668,28 +619,27 @@ class ListFlowsTable(renderers.TableRenderer):
 """
 
   def _GetCreationTime(self, obj):
-    if isinstance(obj, aff4.AFF4Object.GRRFlow):
-      return obj.state.context.get("create_time") or obj.Get(obj.Schema.LAST)
-    else:
-      return 0
+    try:
+      return obj.state.context.get("create_time")
+    except AttributeError:
+      return obj.Get(obj.Schema.LAST, 0)
 
   def __init__(self, **kwargs):
     super(ListFlowsTable, self).__init__(**kwargs)
-    self.AddColumn(renderers.RDFValueColumn(
+    self.AddColumn(semantic.RDFValueColumn(
         "State", renderer=FlowStateIcon, width="40px"))
-    self.AddColumn(FlowColumn("Path", renderer=renderers.SubjectRenderer,
+    self.AddColumn(FlowColumn("Path", renderer=semantic.SubjectRenderer,
                               width="20%"))
-    self.AddColumn(renderers.RDFValueColumn("Flow Name", width="20%"))
-    self.AddColumn(renderers.RDFValueColumn("Creation Time", width="20%"))
-    self.AddColumn(renderers.RDFValueColumn("Last Active", width="20%"))
-    self.AddColumn(renderers.RDFValueColumn("Creator", width="20%"))
+    self.AddColumn(semantic.RDFValueColumn("Flow Name", width="20%"))
+    self.AddColumn(semantic.RDFValueColumn("Creation Time", width="20%"))
+    self.AddColumn(semantic.RDFValueColumn("Last Active", width="20%"))
+    self.AddColumn(semantic.RDFValueColumn("Creator", width="20%"))
 
-  def BuildTable(self, start, _, request):
+  def BuildTable(self, start_row, end_row, request):
     """Renders the table."""
     depth = request.REQ.get("depth", 0)
 
     flow_urn = self.state.get("value", request.REQ.get("value"))
-
     if flow_urn is None:
       client_id = request.REQ.get("client_id")
       if not client_id: return
@@ -698,15 +648,18 @@ class ListFlowsTable(renderers.TableRenderer):
 
     flow_root = aff4.FACTORY.Open(flow_urn, mode="r", token=request.token)
     root_children = list(flow_root.OpenChildren())
-    self.size = len(root_children)
-
-    level2_children = aff4.FACTORY.MultiListChildren(
-        [f.urn for f in root_children], token=request.token)
-
-    row_index = start
-    for flow_obj in sorted(root_children,
+    root_children = sorted(root_children,
                            key=self._GetCreationTime,
-                           reverse=True):
+                           reverse=True)
+    self.size = len(root_children)
+    if not depth:
+      root_children = root_children[start_row:end_row]
+
+    level2_children = dict(aff4.FACTORY.MultiListChildren(
+        [f.urn for f in root_children], token=request.token))
+
+    row_index = start_row
+    for flow_obj in root_children:
       if level2_children.get(flow_obj.urn, None):
         row_type = "branch"
       else:
@@ -719,18 +672,18 @@ class ListFlowsTable(renderers.TableRenderer):
 
       if isinstance(flow_obj, aff4.AFF4Object.GRRFlow):
         row_name = flow_obj.urn.Basename()
-
         try:
           if flow_obj.Get(flow_obj.Schema.CLIENT_CRASH):
             row["State"] = "CLIENT_CRASHED"
           else:
             row["State"] = flow_obj.state.context.state
 
-          row["Flow Name"] = flow_obj.state.context.flow_name
+          row["Flow Name"] = flow_obj.state.context.args.flow_name
           row["Creation Time"] = flow_obj.state.context.create_time
           row["Creator"] = flow_obj.state.context.creator
         except AttributeError:
           row["Flow Name"] = "Failed to open flow."
+
       else:
         # We're dealing with a hunt here.
         row_name = flow_obj.urn.Dirname()
@@ -793,7 +746,7 @@ class HistoricalFlowView(fileview.HistoricalView):
     self.state = dict(flow=request.REQ.get("flow"),
                       attribute=request.REQ.get("attribute"))
 
-    self.AddColumn(renderers.RDFValueColumn(self.state["attribute"]))
+    self.AddColumn(semantic.RDFValueColumn(self.state["attribute"]))
 
     return renderers.TableRenderer.Layout(self, request, response)
 
@@ -805,13 +758,13 @@ class HistoricalFlowView(fileview.HistoricalView):
     if attribute_name is None:
       return
 
-    self.AddColumn(renderers.RDFValueColumn(attribute_name))
+    self.AddColumn(semantic.RDFValueColumn(attribute_name))
     fd = aff4.FACTORY.Open(flow_name, token=request.token, age=aff4.ALL_TIMES)
 
     self.BuildTableFromAttribute(attribute_name, fd, start_row, end_row)
 
 
-class FlowPBRenderer(renderers.RDFProtoRenderer):
+class FlowPBRenderer(semantic.RDFProtoRenderer):
   """Format the FlowPB protobuf."""
   classname = "Flow"
   name = "Flow Protobuf"
@@ -839,12 +792,13 @@ $('#hidden_pre_{{name|escape}}').click(function () {
 
   # Pretty print these special fields.
   translator = dict(
-      pickle=renderers.RDFProtoRenderer.Ignore,
-      children=renderers.RDFProtoRenderer.Ignore,
-      network_bytes_sent=renderers.RDFProtoRenderer.HumanReadableBytes)
+      backtrace=RenderBacktrace,
+      pickle=semantic.RDFProtoRenderer.Ignore,
+      children=semantic.RDFProtoRenderer.Ignore,
+      network_bytes_sent=semantic.RDFProtoRenderer.HumanReadableBytes)
 
 
-class FlowNotificationRenderer(renderers.RDFValueRenderer):
+class FlowNotificationRenderer(semantic.RDFValueRenderer):
   """Renders notifications inside the FlowRenderer."""
   classname = "Notification"
 
@@ -878,19 +832,6 @@ $("#{{unique|escape}}").click(function(){
         sorted([(x, utils.SmartStr(y)) for x, y in h.items()]))
 
 
-class PathspecFormRenderer(renderers.DelegatedTypeInfoRenderer):
-  """Render a form for a pathspec."""
-  type_info_cls = type_info.PathspecType
-
-
-class GrepspecFormRenderer(renderers.DelegatedTypeInfoRenderer):
-  type_info_cls = type_info.GrepspecType
-
-
-class FindspecFormRenderer(renderers.DelegatedTypeInfoRenderer):
-  type_info_cls = type_info.FindSpecType
-
-
 class ClientCrashesRenderer(crash_view.ClientCrashCollectionRenderer):
   """View launched flows in a tree."""
   description = "Crashes"
@@ -901,16 +842,6 @@ class ClientCrashesRenderer(crash_view.ClientCrashCollectionRenderer):
     client_id = request.REQ.get("client_id")
     self.crashes_urn = aff4.ROOT_URN.Add(client_id).Add("crashes")
     super(ClientCrashesRenderer, self).Layout(request, response)
-
-
-class FlowStateRenderer(renderers.DictRenderer):
-  """A Flow state is similar to a dict."""
-  classname = "FlowState"
-
-
-class DataObjectRenderer(renderers.DictRenderer):
-  """A flow data object is also similar to a dict."""
-  classname = "DataObject"
 
 
 class ProgressGraphRenderer(renderers.ImageDownloadRenderer):
@@ -950,3 +881,70 @@ class ProgressGraphRenderer(renderers.ImageDownloadRenderer):
     buf.seek(0)
 
     return buf.read()
+
+
+class GlobalLaunchFlows(renderers.Splitter):
+  """Launches flows that apply across clients."""
+  description = "Start Global Flows"
+  behaviours = frozenset(["General"])
+  order = 10
+
+  left_renderer = "GlobalFlowTree"
+  top_right_renderer = "SemanticProtoFlowForm"
+  bottom_right_renderer = "FlowManagementTabs"
+
+
+class GlobalFlowTree(FlowTree):
+  """Show flows that work across clients."""
+  publish_select_queue = "flow_select"
+  flow_behaviors_to_render = flow.FlowBehaviour("Global Flow")
+
+
+class GlobExpressionFormRenderer(forms.StringTypeFormRenderer):
+  """A renderer for glob expressions with autocomplete."""
+  type = rdfvalue.GlobExpression
+
+  layout_template = ("""<div class="control-group">
+""" + forms.TypeDescriptorFormRenderer.default_description_view + """
+  <div class="controls">
+    <input id='{{this.prefix}}'
+      type=text
+{% if this.default %}
+  value='{{ this.default|escape }}'
+{% endif %}
+      onchange="grr.forms.inputOnChange(this)"
+      class="unset input-xxlarge"/>
+  </div>
+</div>
+<script>
+grr.glob_completer.Completer("{{this.prefix}}", {{this.completions|safe}});
+</script>
+""")
+
+  def AddProtoFields(self, name, attribute_type):
+    for type_info in attribute_type.type_infos:
+      self.completions.append("%s.%s" % (name, type_info.name))
+
+  def _HandleType(self, name, attribute_type):
+    # Skip these types.
+    if attribute_type in (rdfvalue.Dict,):
+      return
+
+    # RDFValueArray contain a specific type.
+    elif issubclass(attribute_type, rdfvalue.RDFValueArray):
+      self._HandleType(name, attribute_type.rdf_type)
+
+    # Semantic Protobufs just contain their own fields.
+    elif issubclass(attribute_type, rdfvalue.RDFProtoStruct):
+      self.AddProtoFields(name, attribute_type)
+
+    else:
+      self.completions.append(name)
+
+  def Layout(self, request, response):
+    self.completions = []
+    for attribute in aff4.AFF4Object.VFSGRRClient.SchemaCls.ListAttributes():
+      if attribute.name:
+        self._HandleType(attribute.name, attribute.attribute_type)
+
+    return super(GlobExpressionFormRenderer, self).Layout(request, response)

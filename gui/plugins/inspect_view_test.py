@@ -38,7 +38,7 @@ class TestInspectView(test_lib.GRRSeleniumTest):
 
     self.Click("css=a:contains(Interrogate)")
 
-    self.Click("css=input[value=Launch]")
+    self.Click("css=button.Launch")
 
     # Open the "Advanced" dropdown.
     self.Click("css=a[href='#HostAdvanced']")
@@ -48,7 +48,7 @@ class TestInspectView(test_lib.GRRSeleniumTest):
     self.WaitUntil(self.IsElementPresent, "css=td:contains(GetPlatformInfo)")
 
     # Check that the we can see the requests in the table.
-    for request in "GetPlatformInfo GetConfig EnumerateInterfaces Find".split():
+    for request in "GetPlatformInfo GetConfig EnumerateInterfaces".split():
       self.assertTrue(self.IsElementPresent(
           "css=td:contains(%s)" % request))
 

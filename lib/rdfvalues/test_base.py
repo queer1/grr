@@ -8,8 +8,14 @@ from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib import type_info
 
+# pylint:mode=test
 
-class GenericRDFProtoTest(test_lib.AFF4ObjectTest):
+
+class RDFValueBaseTest(test_lib.GRRBaseTest):
+  pass
+
+
+class GenericRDFProtoTest(RDFValueBaseTest):
   def testNestedProtobufAssignment(self):
     """Check that we can assign a nested protobuf."""
     container = rdfvalue.VolatilityRequest()
@@ -39,7 +45,7 @@ class GenericRDFProtoTest(test_lib.AFF4ObjectTest):
   def testSimpleTypeAssignment(self):
     sample = rdfvalue.StatEntry()
     sample.AddDescriptor(type_info.ProtoRDFValue(
-        name="test", field_number=45,
+        name="test", field_number=45, default=rdfvalue.RDFInteger(0),
         rdf_type=rdfvalue.RDFInteger))
 
     # Ensure there is an rdf_map so we know that st_size is an RDFInteger:
@@ -154,7 +160,7 @@ class GenericRDFProtoTest(test_lib.AFF4ObjectTest):
     self.assertEqual(str(sample.status), "OK")
 
 
-class RDFValueTestCase(test_lib.GRRBaseTest):
+class RDFValueTestCase(RDFValueBaseTest):
   """The base class for testing RDFValue implementations."""
 
   # This should be overridden by the RDFValue class we want to test.
@@ -208,17 +214,17 @@ class RDFValueTestCase(test_lib.GRRBaseTest):
 
     self.CheckRDFValue(self.rdfvalue_class(sample), sample)
 
-  def testSerialization(self):
+  def testSerialization(self, sample=None):
     """Make sure the RDFValue instance can be serialized."""
-    sample = self.GenerateSample()
+    if sample is None:
+      sample = self.GenerateSample()
 
     # Serializing to a string must produce a string.
     serialized = sample.SerializeToString()
     self.assertIsInstance(serialized, str)
 
     # Ensure we can parse it again.
-    rdfvalue_object = self.rdfvalue_class()
-    rdfvalue_object.ParseFromString(serialized)
+    rdfvalue_object = self.rdfvalue_class(serialized)
     self.CheckRDFValue(rdfvalue_object, sample)
 
     # Also by initialization.
@@ -232,14 +238,14 @@ class RDFValueTestCase(test_lib.GRRBaseTest):
       self.assertIsInstance(serialized, str)
     elif self.rdfvalue_class.data_store_type == "string":
       self.assertIsInstance(serialized, unicode)
-    elif self.rdfvalue_class.data_store_type == "integer":
+    elif self.rdfvalue_class.data_store_type in [
+        "unsigned_integer", "integer"]:
       self.assertIsInstance(serialized, (int, long))
     else:
       self.fail("%s has no valid data_store_type" % self.rdfvalue_class)
 
     # Ensure we can parse it again.
-    rdfvalue_object = self.rdfvalue_class()
-    rdfvalue_object.ParseFromDataStore(serialized)
+    rdfvalue_object = self.rdfvalue_class(serialized)
     self.CheckRDFValue(rdfvalue_object, sample)
 
 

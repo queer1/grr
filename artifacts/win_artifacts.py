@@ -12,22 +12,6 @@ Collector = artifact_lib.Collector        # pylint: disable=g-bad-name
 
 
 ################################################################################
-#  Windows specific conditions
-################################################################################
-
-
-# TODO(user): Deprecate these once we move to the objectfilter scheme.
-def VistaOrNewer(knowledge_base):
-  """Is the client newer than Windows Vista?"""
-  return (knowledge_base.os_major_version >=
-          constants.MAJOR_VERSION_WINDOWS_VISTA)
-
-
-def NotVistaOrNewer(client):
-  return not VistaOrNewer(client)
-
-
-################################################################################
 #  Core Windows system artifacts
 ################################################################################
 
@@ -39,8 +23,17 @@ class WinTimeZone(Artifact):
   LABELS = ["KnowledgeBase"]
   COLLECTORS = [
       Collector(action="GetRegistryValue",
-                args={"path": r"%%current_control_set%%\Control\TimeZoneInformation\TimeZoneKeyName"})]
+                args={"path": r"%%current_control_set%%\Control\TimeZoneInformation\StandardName"})]
   PROVIDES = "time_zone"
+
+
+class AvailableTimeZones(Artifact):
+  """The timezones avaialable on the system."""
+  URLS = ["https://code.google.com/p/winreg-kb/wiki/TimeZoneKeys"]
+  SUPPORTED_OS = ["Windows"]
+  COLLECTORS = [
+      Collector(action="GetRegistryKeys",
+                args={"path_list": [r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones\*\*"]})]
 
 
 class WinCodePage(Artifact):
@@ -168,8 +161,89 @@ class AllUsersProfileEnvironmentVariable(Artifact):
   PROVIDES = "environ_allusersprofile"
   COLLECTORS = [
       Collector(action="GetRegistryKeys",
-                args={"paths": [r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory",
-                                r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\ProfileList\AllUsersProfile"]})
+                args={"path_list": [r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory",
+                                    r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\ProfileList\AllUsersProfile"]})
+      ]
+
+
+################################################################################
+#  Windows user related information
+################################################################################
+
+
+class WindowsRegistryProfiles(Artifact):
+  """Get SIDs for all users on the system with profiles present in the registry.
+
+  This looks in the Windows registry where the profiles are stored and retrieves
+  the paths for each profile.
+  """
+  URLS = ["http://msdn.microsoft.com/en-us/library/windows/desktop/bb776892(v=vs.85).aspx"]
+  SUPPORTED_OS = ["Windows"]
+  LABELS = ["Users", "KnowledgeBase"]
+  COLLECTORS = [
+      Collector(action="GetRegistryKeys",
+                args={"path_list": [r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*\ProfileImagePath"]}
+               )
+  ]
+  PROVIDES = ["users.sid", "users.userprofile", "users.homedir"]
+
+
+class WindowsWMIProfileUsers(Artifact):
+  """Get user information based on known user's SID.
+
+  This artifact optimizes retrieval of user information by limiting the WMI
+  query to users for which we have a SID for. Specifically this solves the issue
+  that in a domain setting, querying for all users via WMI will give you the
+  list of all local and domain accounts which means a large data transfer from
+  an Active Directory server.
+
+  This artifact relies on having the SID field users.sid populated knowledge
+  base.
+  """
+  URLS = ["http://msdn.microsoft.com/en-us/library/windows/desktop/aa394507(v=vs.85).aspx"]
+  SUPPORTED_OS = ["Windows"]
+  LABELS = ["Users", "KnowledgeBase"]
+  COLLECTORS = [
+      Collector(action="WMIQuery",
+                args={"query": "SELECT * FROM Win32_UserAccount "
+                               "WHERE name='%%users.username%%'"}
+               )
+  ]
+  PROVIDES = ["users.username", "users.userdomain", "users.sid"]
+
+
+class WindowsWMIUsers(Artifact):
+  """Get all users the system knows about via WMI.
+
+  Note that in a domain setup, this will probably return all users in the
+  domain which will be expensive and slow. Consider WindowsWMIProfileUsers
+  instead.
+  """
+  URLS = ["http://msdn.microsoft.com/en-us/library/windows/desktop/aa394507(v=vs.85).aspx"]
+  LABELS = ["Users"]
+  SUPPORTED_OS = ["Windows"]
+
+  COLLECTORS = [
+      Collector(action="WMIQuery",
+                args={"query": "SELECT * FROM Win32_UserAccount"}
+               )
+  ]
+
+
+class UserShellFolders(Artifact):
+  """The Shell Folders information for Windows users."""
+  SUPPORTED_OS = ["Windows"]
+  LABELS = ["KnowledgeBase"]
+  PROVIDES = ["users.cookies", "users.appdata", "users.personal",
+              "users.startup", "users.homedir", "users.desktop",
+              "users.local_settings", "users.internet_cache",
+              "users.localappdata", "users.localappdata_low" "users.recent",
+              "users.userprofile", "users.temp"]
+
+  COLLECTORS = [
+      Collector(action="GetRegistryKeys",
+                args={"path_list": [r"HKEY_USERS\%%users.sid%%\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders\*",
+                                    r"HKEY_USERS\%%users.sid%%\Environment\*"]})
       ]
 
 
@@ -180,30 +254,28 @@ class AllUsersProfileEnvironmentVariable(Artifact):
 
 class AbstractEventLogEvtx(Artifact):
   URLS = ["http://www.forensicswiki.org/wiki/Windows_XML_Event_Log_(EVTX)"]
-  CONDITIONS = [VistaOrNewer]
+  CONDITIONS = ["os_major_version >= %s" % constants.MAJOR_VERSION_WINDOWS_VISTA]
   SUPPORTED_OS = ["Windows"]
   LABELS = ["Logs"]
-  PATH_VARS = {"log_path": "%%environ_systemroot%%\\System32\\winevt\\Logs"}
-  PROCESSORS = ["EvtxLogParser"]
 
 
 class ApplicationEventLogEvtx(AbstractEventLogEvtx):
   """Windows Application Event Log for Vista or newer systems."""
   COLLECTORS = [
       Collector(action="GetFile",
-                args={"path": "%%environ_systemroot%%\\System32\\winevt\\Logs\\Application.evtx"})]
+                args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\Application.evtx"})]
 
 
 class SystemEventLogEvtx(AbstractEventLogEvtx):
   """Windows System Event Log for Vista or newer systems."""
   COLLECTORS = [
-      Collector(action="GetFile", args={"path": "{log_path}\\System.evtx"})]
+      Collector(action="GetFile", args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\System.evtx"})]
 
 
 class SecurityEventLogEvtx(AbstractEventLogEvtx):
   """Windows Security Event Log for Vista or newer systems."""
   COLLECTORS = [
-      Collector(action="GetFile", args={"path": "{log_path}\\Security.evtx"})]
+      Collector(action="GetFile", args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\Security.evtx"})]
 
 
 class TerminalServicesEventLogEvtx(AbstractEventLogEvtx):
@@ -214,7 +286,7 @@ RDP/TerminalServices to the machine.
 """
   COLLECTORS = [
       Collector(action="GetFile",
-                args={"path": "{log_path}\\Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx"})]
+                args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx"})]
 
 
 ################################################################################
@@ -225,13 +297,13 @@ RDP/TerminalServices to the machine.
 class AbstractEventLog(Artifact):
   URLS = ["http://www.forensicswiki.org/wiki/Windows_Event_Log_(EVT)"]
   SUPPORTED_OS = ["Windows"]
-  CONDITIONS = [NotVistaOrNewer]
+  CONDITIONS = ["os_major_version >= %s" % constants.MAJOR_VERSION_WINDOWS_VISTA]
   LABELS = ["Logs"]
 
 
 class AbstractWMIArtifact(Artifact):
   SUPPORTED_OS = ["Windows"]
-  CONDITIONS = [VistaOrNewer]
+  CONDITIONS = ["os_major_version >= %s" % constants.MAJOR_VERSION_WINDOWS_VISTA]
 
 
 class ApplicationEventLog(AbstractEventLog):
@@ -239,7 +311,7 @@ class ApplicationEventLog(AbstractEventLog):
   COLLECTORS = [
       Collector(
           action="GetFile",
-          args={"path": "%%environ_systemroot%%\\System32\\winevt\\Logs\\AppEvent.evt"}
+          args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\AppEvent.evt"}
           )]
 
 
@@ -248,7 +320,7 @@ class SystemEventLog(AbstractEventLog):
   COLLECTORS = [
       Collector(
           action="GetFile",
-          args={"path": "%%environ_systemroot%%\\System32\\winevt\\Logs\\SysEvent.evt"}
+          args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\SysEvent.evt"}
           )]
 
 
@@ -257,8 +329,13 @@ class SecurityEventLog(AbstractEventLog):
   COLLECTORS = [
       Collector(
           action="GetFile",
-          args={"path": "%%environ_systemroot%%\\System32\\winevt\\Logs\\SecEvent.evt"}
+          args={"path": r"%%environ_systemroot%%\System32\winevt\Logs\SecEvent.evt"}
           )]
+
+
+################################################################################
+#  Software Artifacts
+################################################################################
 
 
 class WindowsWMIInstalledSoftware(AbstractWMIArtifact):
@@ -267,8 +344,8 @@ class WindowsWMIInstalledSoftware(AbstractWMIArtifact):
 
   COLLECTORS = [
       Collector(action="WMIQuery",
-                args={"query": "SELECT Name, Vendor, Description, InstallDate, InstallDate2, Version"
-                      " from Win32_Product"}
+                args={"query": "SELECT Name, Vendor, Description, InstallDate, InstallDate2, Version "
+                               "from Win32_Product"}
                )
   ]
 
@@ -280,6 +357,127 @@ class WindowsDrivers(AbstractWMIArtifact):
   COLLECTORS = [
       Collector(action="WMIQuery",
                 args={"query": "SELECT DisplayName, Description, InstallDate, Name, PathName, Status, State, ServiceType "
-                      "from Win32_SystemDriver"}
+                               "from Win32_SystemDriver"}
                )
   ]
+
+
+class WindowsHotFixes(AbstractWMIArtifact):
+  """Extract the installed hotfixes on Windows via WMI."""
+  LABELS = ["Software"]
+
+  COLLECTORS = [
+      Collector(action="WMIQuery",
+                args={"query": "SELECT * "
+                               "from Win32_QuickFixEngineering"}
+               )
+  ]
+
+
+class WindowsRunKeys(Artifact):
+  """Collect windows run keys."""
+  LABELS = ["Software"]
+  SUPPORTED_OS = ["Windows"]
+  COLLECTORS = [
+      Collector(action="GetRegistryKeys",
+                args={"path_list":
+                      [r"HKEY_USERS\%%users.sid%%\Software\Microsoft\Windows\CurrentVersion\Run\*",
+                       r"HKEY_USERS\%%users.sid%%\Software\Microsoft\Windows\CurrentVersion\RunOnce\*",
+                       r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Run\*",
+                       r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\RunOnce\*"]})]
+
+
+class WindowsServices(Artifact):
+  """Collect windows services from the registry.
+
+  See service key doco:
+    http://support.microsoft.com/kb/103000
+  """
+  LABELS = ["Software"]
+  SUPPORTED_OS = ["Windows"]
+  COLLECTORS = [
+      Collector(action="GetRegistryKeys",
+                args={"path_list":
+                      [r"%%current_control_set%%\services\*\*",
+                       r"%%current_control_set%%\services\*\Parameters\*"]})]
+
+
+class WindowsPersistenceMechanisms(Artifact):
+  """Collect persistence mechanisms."""
+  LABELS = ["Software"]
+  SUPPORTED_OS = ["Windows"]
+  COLLECTORS = [
+      Collector(action="CollectArtifacts",
+                args={"artifact_list": ["WindowsRunKeys", "WindowsServices"]},
+                returned_types=["PersistenceFile"])
+      ]
+
+
+class WindowsPersistenceMechanismFiles(Artifact):
+  """Collect files that are run by Windows persistence mechanisms."""
+  LABELS = ["Software"]
+  SUPPORTED_OS = ["Windows"]
+  COLLECTORS = [
+      Collector(action="CollectArtifactFiles",
+                args={"artifact_list": ["WindowsPersistenceMechanisms"],
+                      "pathspec_attribute": "pathspec"},
+                returned_types=["StatEntry"])
+      ]
+
+
+################################################################################
+#  User Artifacts
+################################################################################
+
+
+class WindowsAdminUsers(AbstractWMIArtifact):
+  """Extract the Aministrators on Windows via WMI."""
+  LABELS = ["Software"]
+
+  COLLECTORS = [
+      Collector(action="WMIQuery",
+                args={"query": "SELECT * "
+                               "from Win32_GroupUser where Name = \"Administrators\""}
+               )
+  ]
+
+
+class WindowsLoginUsers(AbstractWMIArtifact):
+  """Extract the Login Users on Windows via WMI.
+
+  If on a domain this will query the domain which may take a long time and
+  create load on a domain controller.
+  """
+  LABELS = ["Software"]
+
+  COLLECTORS = [
+      Collector(action="WMIQuery",
+                args={"query": "SELECT * "
+                               "from Win32_GroupUser where Name = \"login_users\""}
+               )
+  ]
+
+
+class WMIProcessList(AbstractWMIArtifact):
+  """Extract the process list on Windows via WMI."""
+  LABELS = ["Software"]
+
+  COLLECTORS = [
+      Collector(action="WMIQuery",
+                args={"query": "SELECT * "
+                               "from Win32_Process"}
+               )
+  ]
+
+
+################################################################################
+#  Network Artifacts
+################################################################################
+
+
+class WinHostsFile(Artifact):
+  """The Windows hosts file."""
+  SUPPORTED_OS = ["Windows"]
+  COLLECTORS = [
+      Collector(action="GetFile",
+                args={"path": "%%environ_systemroot%%\\System32\\Drivers\\etc\\hosts"})]

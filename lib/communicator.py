@@ -9,6 +9,7 @@ import zlib
 
 from M2Crypto import BIO
 from M2Crypto import EVP
+from M2Crypto import m2
 from M2Crypto import Rand
 from M2Crypto import RSA
 from M2Crypto import X509
@@ -19,15 +20,6 @@ from grr.lib import registry
 from grr.lib import stats
 from grr.lib import type_info
 from grr.lib import utils
-
-
-config_lib.DEFINE_integer("Network.api", 3,
-                          "The version of the network protocol the client "
-                          "uses.")
-
-
-config_lib.DEFINE_string("Network.compression", default="ZCOMPRESS",
-                         help="Type of compression (ZCOMPRESS, UNCOMPRESSED)")
 
 # Constants.
 ENCRYPT = 1
@@ -169,8 +161,7 @@ class Cipher(object):
     digest = self.hash_function(serialized_cipher).digest()
 
     # We never want to have a password dialog
-    private_key = RSA.load_key_string(str(self.private_key),
-                                      callback=lambda x: "")
+    private_key = self.private_key.GetPrivateKey()
 
     self.cipher_metadata.signature = private_key.sign(
         digest, self.hash_function_name)
@@ -179,8 +170,10 @@ class Cipher(object):
     rsa_key = pub_key_cache.GetRSAPublicKey(destination)
 
     stats.STATS.IncrementCounter("grr_rsa_operations")
-    self.encrypted_cipher = rsa_key.public_encrypt(
-        serialized_cipher, self.e_padding)
+    # M2Crypto verifies the key on each public_encrypt call which is horribly
+    # slow therefore we just call the swig wrapped method directly.
+    self.encrypted_cipher = m2.rsa_public_encrypt(
+        rsa_key.rsa, serialized_cipher, self.e_padding)
 
     # Encrypt the metadata block symmetrically.
     _, self.encrypted_cipher_metadata = self.Encrypt(
@@ -231,12 +224,14 @@ class ReceivedCipher(Cipher):
     self.pub_key_cache = pub_key_cache
 
     # Decrypt the message
-    private_key = RSA.load_key_string(str(self.private_key),
-                                      callback=lambda x: "")
+    private_key = self.private_key.GetPrivateKey()
+
     try:
       self.encrypted_cipher = response_comms.encrypted_cipher
-      self.serialized_cipher = private_key.private_decrypt(
-          response_comms.encrypted_cipher, self.e_padding)
+      # M2Crypto verifies the key on each private_decrypt call which is horribly
+      # slow therefore we just call the swig wrapped method directly.
+      self.serialized_cipher = m2.rsa_private_decrypt(
+          private_key.rsa, response_comms.encrypted_cipher, self.e_padding)
 
       self.cipher = rdfvalue.CipherProperties(self.serialized_cipher)
 
@@ -334,7 +329,7 @@ class Communicator(object):
         signed_message_list.message_list = compressed_data
 
   def EncodeMessages(self, message_list, result, destination=None,
-                     timestamp=None, api_version=2):
+                     timestamp=None, api_version=3):
     """Accepts a list of messages and encodes for transmission.
 
     This function signs and then encrypts the payload.
@@ -392,8 +387,7 @@ class Communicator(object):
       digest = cipher.hash_function(signed_message_list.message_list).digest()
 
       # We never want to have a password dialog
-      private_key = RSA.load_key_string(str(self.private_key),
-                                        callback=lambda x: "")
+      private_key = self.private_key.GetPrivateKey()
 
       signed_message_list.signature = private_key.sign(
           digest, cipher.hash_function_name)
@@ -435,7 +429,8 @@ class Communicator(object):
     try:
       response_comms = rdfvalue.ClientCommunication(encrypted_response)
       return self.DecodeMessages(response_comms)
-    except (rdfvalue.DecodeError, type_info.TypeValueError, ValueError) as e:
+    except (rdfvalue.DecodeError, type_info.TypeValueError,
+            ValueError, AttributeError) as e:
       raise DecodingError("Protobuf parsing error: %s" % e)
 
   def DecompressMessageList(self, signed_message_list):

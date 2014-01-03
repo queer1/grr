@@ -14,7 +14,6 @@ from grr.lib import build_test
 from grr.lib import communicator_test
 from grr.lib import config_lib_test
 from grr.lib import config_validation_test
-from grr.lib import cron_test
 from grr.lib import data_store_test
 from grr.lib import export_test
 from grr.lib import export_utils_test
@@ -24,8 +23,10 @@ from grr.lib import front_end_test
 from grr.lib import hunt_test
 from grr.lib import lexer_test
 from grr.lib import objectfilter_test
-from grr.lib import scheduler_test
+from grr.lib import parsers_test
+from grr.lib import queue_manager_test
 from grr.lib import search_test
+from grr.lib import stats_store_test
 from grr.lib import stats_test
 from grr.lib import test_lib
 from grr.lib import threadpool_test
@@ -35,6 +36,7 @@ from grr.lib import utils_test
 from grr.lib.aff4_objects import tests
 from grr.lib.data_stores import tests
 from grr.lib.flows import tests
+from grr.lib.hunts import tests
 from grr.lib.rdfvalues import tests
 from grr.tools import entry_point_test
 # pylint: enable=unused-import

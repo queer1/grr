@@ -45,6 +45,19 @@ class DurationTest(test_base.RDFValueTestCase):
     self.assertEqual(str(t), "5m")
 
 
+class ByteSizeTest(test_base.RDFValueTestCase):
+  rdfvalue_class = rdfvalue.ByteSize
+
+  def GenerateSample(self, number=5):
+    return rdfvalue.ByteSize("%sKib" % number)
+
+  def testParsing(self):
+    for string, expected in [("100gb", 100 * 1000**3),
+                             ("10kib", 10*1024),
+                             ("2.5kb", 2500)]:
+      self.assertEqual(expected, rdfvalue.ByteSize(string))
+
+
 class RDFURNTest(test_base.RDFValueTestCase):
   rdfvalue_class = rdfvalue.RDFURN
 
@@ -73,6 +86,21 @@ class RDFURNTest(test_base.RDFValueTestCase):
     str_url = "aff4:/C.0000000000000000/fs/os/c/regex.*?]&[+{}--"
     url = rdfvalue.RDFURN(str_url, age=1)
     self.assertEqual(url.Path(), str_url[5:])
+
+  def testInitialization(self):
+    """Check that we can initialize from common initializers."""
+
+    # Empty Initializer not allowed.
+    self.assertRaises(ValueError, self.rdfvalue_class)
+
+    # Initialize from another instance.
+    sample = self.GenerateSample("aff4:/")
+
+    self.CheckRDFValue(self.rdfvalue_class(sample), sample)
+
+  def testSerialization(self, sample=None):
+    sample = self.GenerateSample("aff4:/")
+    super(RDFURNTest, self).testSerialization(sample=sample)
 
 
 class RDFDatetimeTest(test_base.RDFValueTestCase):
@@ -113,6 +141,55 @@ class RDFDatetimeTest(test_base.RDFValueTestCase):
     finally:
       time.time = orig_time
 
+  def testAddNumber(self):
+    date = rdfvalue.RDFDatetime(1e9)
+    self.assertEqual(int(date + 60), 1e9 + 60e6)
+    self.assertEqual(int(date + 1000.23), 1e9 + 1000230e3)
+    self.assertEqual(int(date + (-10)), 1e9 - 10e6)
+
+  def testSubNumber(self):
+    date = rdfvalue.RDFDatetime(1e9)
+    self.assertEqual(int(date - 60), 1e9 - 60e6)
+    self.assertEqual(int(date - (-1000.23)), 1e9 + 1000230e3)
+    self.assertEqual(int(date - 1e12), 1e9 - 1e18)
+
+  def testAddDuration(self):
+    duration = rdfvalue.Duration("12h")
+    date = rdfvalue.RDFDatetime(1e9)
+    self.assertEqual(int(date + duration), 1e9 + 12 * 3600e6)
+    duration = rdfvalue.Duration("-60s")
+    self.assertEqual(int(date + duration), 1e9 - 60e6)
+
+  def testSubDuration(self):
+    duration = rdfvalue.Duration("5m")
+    date = rdfvalue.RDFDatetime(1e9)
+    self.assertEqual(int(date - duration), 1e9 - 5 * 60e6)
+    duration = rdfvalue.Duration("-60s")
+    self.assertEqual(int(date - duration), 1e9 + 60e6)
+    duration = rdfvalue.Duration("1w")
+    self.assertEqual(int(date - duration), 1e9 - 7 * 24 * 3600e6)
+
 
 class RDFDatetimeSecondsTest(RDFDatetimeTest):
   rdfvalue_class = rdfvalue.RDFDatetimeSeconds
+
+
+class HashDigestTest(test_base.RDFValueTestCase):
+  rdfvalue_class = rdfvalue.HashDigest
+
+  def GenerateSample(self, number=0):
+    return rdfvalue.HashDigest("\xca\x97\x81\x12\xca\x1b\xbd\xca\xfa\xc21\xb3"
+                               "\x9a#\xdcM\xa7\x86\xef\xf8\x14|Nr\xb9\x80w\x85"
+                               "\xaf\xeeH\xbb%s" % number)
+
+  def testEqNeq(self):
+    binary_digest = ("\xca\x97\x81\x12\xca\x1b\xbd\xca\xfa\xc21\xb3"
+                     "\x9a#\xdcM\xa7\x86\xef\xf8\x14|Nr\xb9\x80w\x85"
+                     "\xaf\xeeH\xbb")
+    sample = rdfvalue.HashDigest(binary_digest)
+    hex_digest = ("ca978112ca1bbdcafac231b39a23dc4da786eff81"
+                  "47c4e72b9807785afee48bb")
+    self.assertEqual(sample, hex_digest)
+    self.assertEqual(sample, binary_digest)
+    self.assertNotEqual(sample, "\xaa\xbb")
+    self.assertNotEqual(sample, "deadbeef")

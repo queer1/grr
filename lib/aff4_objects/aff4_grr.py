@@ -11,12 +11,12 @@ import logging
 from grr.lib import access_control
 from grr.lib import aff4
 from grr.lib import flow
+from grr.lib import queue_manager
 from grr.lib import rdfvalue
 from grr.lib import registry
-from grr.lib import scheduler
-from grr.lib import type_info
 from grr.lib import utils
 from grr.lib.aff4_objects import standard
+from grr.proto import flows_pb2
 
 
 class SpaceSeparatedStringArray(rdfvalue.RDFString):
@@ -139,6 +139,10 @@ class VFSGRRClient(standard.VFSDirectory):
         "aff4:last_foreman_time", rdfvalue.RDFDatetime,
         "The last time the foreman checked us.", versioned=False)
 
+    SUMMARY = aff4.Attribute(
+        "aff4:summary", rdfvalue.ClientSummary,
+        "A summary of this client", versioned=False)
+
   # Valid client ids
   CLIENT_ID_RE = re.compile(r"^C\.[0-9a-fA-F]{16}$")
 
@@ -148,7 +152,8 @@ class VFSGRRClient(standard.VFSDirectory):
 
   def Update(self, attribute=None, priority=None):
     if attribute == self.Schema.CONTAINS:
-      flow_id = flow.GRRFlow.StartFlow(self.client_id, "Interrogate",
+      flow_id = flow.GRRFlow.StartFlow(client_id=self.client_id,
+                                       flow_name="Interrogate",
                                        token=self.token, priority=priority)
 
       return flow_id
@@ -181,9 +186,6 @@ class VFSGRRClient(standard.VFSDirectory):
     if not isinstance(pathspec, rdfvalue.RDFValue):
       raise ValueError("Pathspec should be an rdfvalue.")
 
-    # Do not change the argument pathspec.
-    pathspec = pathspec.Copy()
-
     # If the first level is OS and the second level is TSK its probably a mount
     # point resolution. We map it into the tsk branch. For example if we get:
     # path: \\\\.\\Volume{1234}\\
@@ -206,7 +208,7 @@ class VFSGRRClient(standard.VFSDirectory):
                 dev]
 
       # Skip the top level pathspec.
-      pathspec.Pop()
+      pathspec = pathspec[1]
     else:
       # For now just map the top level prefix based on the first pathtype
       result = [VFSGRRClient.AFF4_PREFIXES[pathspec[0].pathtype]]
@@ -230,45 +232,51 @@ class VFSGRRClient(standard.VFSDirectory):
 
     return client_urn.Add("/".join(result))
 
+  def GetSummary(self):
+    """Gets a client summary object."""
+    summary = self.Get(self.Schema.SUMMARY)
+    if summary is None:
+      summary = rdfvalue.ClientSummary(client_id=self.urn)
+      summary.system_info.node = self.Get(self.Schema.HOSTNAME)
+      summary.system_info.system = self.Get(self.Schema.SYSTEM)
+      summary.system_info.release = self.Get(self.Schema.OS_RELEASE)
+      summary.system_info.version = str(self.Get(self.Schema.OS_VERSION, ""))
+      summary.system_info.fqdn = self.Get(self.Schema.FQDN)
+      summary.system_info.machine = self.Get(self.Schema.ARCH)
+      summary.system_info.install_date = self.Get(self.Schema.INSTALL_DATE)
+
+      summary.users = self.Get(self.Schema.USER)
+      summary.interfaces = self.Get(self.Schema.INTERFACES)
+      summary.client_info = self.Get(self.Schema.CLIENT_INFO)
+
+    return summary
+
+
+class UpdateVFSFileArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.UpdateVFSFileArgs
+
 
 class UpdateVFSFile(flow.GRRFlow):
   """A flow to update VFS file."""
-
-  flow_typeinfo = type_info.TypeDescriptorSet(
-      type_info.RDFURNType(
-          description="VFSFile urn",
-          name="vfs_file_urn"),
-      type_info.String(
-          description="Attribute to update",
-          name="attribute",
-          default=str(aff4.AFF4Volume.SchemaCls.CONTAINS)),
-      )
+  args_type = UpdateVFSFileArgs
 
   def Init(self):
     self.state.Register("get_file_flow_urn")
 
   @flow.StateHandler()
   def Start(self):
-    """Calls Update() method of a given VFSFile/VFSDirectory object.
-
-    This method uses token with supervisor=True, because we assume that
-    if the user is allowed to run flows on the client, he is priviledged
-    enough to call Update on VFSFiles/VFSDirectories below this client.
-    """
+    """Calls the Update() method of a given VFSFile/VFSDirectory object."""
     self.Init()
 
-    super_token = self.token.Copy()
-    super_token.supervisor = True
-
-    fd = aff4.FACTORY.Open(self.state.vfs_file_urn, mode="rw",
-                           token=super_token)
+    fd = aff4.FACTORY.Open(self.args.vfs_file_urn, mode="rw",
+                           token=self.token)
 
     # Account for implicit directories.
     if fd.Get(fd.Schema.TYPE) is None:
       fd = fd.Upgrade("VFSDirectory")
 
     self.state.get_file_flow_urn = fd.Update(
-        attribute=self.state.attribute,
+        attribute=self.args.attribute,
         priority=rdfvalue.GrrMessage.Priority.HIGH_PRIORITY)
 
 
@@ -287,9 +295,6 @@ class VFSFile(aff4.AFF4Image):
     PATHSPEC = aff4.Attribute(
         "aff4:pathspec", rdfvalue.PathSpec,
         "The pathspec used to retrieve this object from the client.")
-
-    HASH = aff4.Attribute("aff4:sha256", rdfvalue.RDFSHAValue,
-                          "SHA256 hash.")
 
     FINGERPRINT = aff4.Attribute("aff4:fingerprint",
                                  rdfvalue.FingerprintResponse,
@@ -312,7 +317,8 @@ class VFSFile(aff4.AFF4Image):
 
     # Get the pathspec for this object
     pathspec = self.Get(self.Schema.STAT).pathspec
-    flow_urn = flow.GRRFlow.StartFlow(client_id, "GetFile", token=self.token,
+    flow_urn = flow.GRRFlow.StartFlow(client_id=client_id,
+                                      flow_name="GetFile", token=self.token,
                                       pathspec=pathspec, priority=priority)
     self.Set(self.Schema.CONTENT_LOCK(flow_urn))
     self.Close()
@@ -412,8 +418,8 @@ class GRRForeman(aff4.AFF4Object):
       for session_id in expired_session_ids:
         priorities[session_id] = rdfvalue.GrrMessage.Priority.MEDIUM_PRIORITY
 
-      scheduler.SCHEDULER.MultiNotifyQueue(list(expired_session_ids),
-                                           priorities, token=self.token)
+      manager = queue_manager.QueueManager(token=self.token)
+      manager.MultiNotifyQueue(list(expired_session_ids), priorities)
 
     if len(new_rules) < len(rules):
       self.Set(self.Schema.RULES, new_rules)
@@ -496,12 +502,14 @@ class GRRForeman(aff4.AFF4Object):
           else:
             logging.info("Foreman: Starting hunt %s on client %s.",
                          action.hunt_id, client_id)
+
             flow_cls = flow.GRRFlow.classes[action.hunt_name]
-            flow_cls.StartClient(action.hunt_id, client_id, action.client_limit)
+            flow_cls.StartClient(action.hunt_id, client_id)
             actions_count += 1
         else:
-          flow.GRRFlow.StartFlow(client_id, action.flow_name, token=token,
-                                 **action.argv.ToDict())
+          flow.GRRFlow.StartFlow(
+              client_id=client_id, flow_name=action.flow_name, token=token,
+              **action.argv.ToDict())
           actions_count += 1
       # There could be all kinds of errors we don't know about when starting the
       # flow/hunt so we catch everything here.
@@ -723,5 +731,12 @@ class AFF4RegexNotificationRule(aff4.AFF4NotificationRule):
           args=aff4_object.urn.SerializeToString(),
           auth_state=rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED,
           source=client_name)
-      flow.PublishEvent(utils.SmartStr(self.event_name), event,
-                        token=self.token)
+      flow.Events.PublishEvent(utils.SmartStr(self.event_name), event,
+                               token=self.token)
+
+
+class VFSBlobImage(aff4.BlobImage, aff4.VFSFile):
+  """BlobImage with VFS attributes for use in client namespace."""
+
+  class SchemaCls(aff4.BlobImage.SchemaCls, aff4.VFSFile.SchemaCls):
+    pass

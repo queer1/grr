@@ -9,6 +9,10 @@ import "grr/proto/semantic.proto";
 
 // A Process record describing a system process.
 message Process {
+  option (semantic) = {
+    description: "Process information."
+  };
+
   optional uint32 pid = 1;
   optional uint32 ppid = 2;
   optional string name = 3;
@@ -60,13 +64,14 @@ message NetworkConnection {
   optional NetworkEndpoint local_address = 3;
   optional NetworkEndpoint remote_address = 4;
 
+  // This enum contains connection states as returned by psutils.
   enum State {
     UNKNOWN = 0;
     CLOSED = 1;
     LISTEN = 2;
     SYN_SENT = 3;
-    SYN_RCVD = 4;
-    ESTAB = 5;
+    SYN_RECV = 4;
+    ESTABLISHED = 5;
     FIN_WAIT1 = 6;
     FIN_WAIT2 = 7;
     CLOSE_WAIT = 8;
@@ -74,6 +79,9 @@ message NetworkConnection {
     LAST_ACK = 10;
     TIME_WAIT = 11;
     DELETE_TCB = 12;
+    // psutils later than v1.0 return "NONE" instead of "UNKNOWN" so we
+    // support both.
+    NONE = 13;
   };
   optional State state = 5 [default = UNKNOWN];
   optional uint32 pid = 6;

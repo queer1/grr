@@ -3,7 +3,9 @@
 """RDFValue implementations related to flow scheduling."""
 
 
-import cPickle as pickle
+import cPickle
+import pickle
+import StringIO
 import threading
 import time
 
@@ -19,9 +21,14 @@ class GrrMessage(rdfvalue.RDFProtoStruct):
   lock = threading.Lock()
   next_id_base = 0
   max_ttl = 5
+  # We prefix the task id with the encoded priority of the message so it gets
+  # read first from data stores that support sorted reads. We reserve 3 bits
+  # for this so there can't be more than 8 different levels of priority.
+  max_priority = 7
 
   def __init__(self, initializer=None, age=None, payload=None, **kwarg):
     super(GrrMessage, self).__init__(initializer=initializer, age=age, **kwarg)
+
     if payload:
       self.payload = payload
 
@@ -50,9 +57,14 @@ class GrrMessage(rdfvalue.RDFProtoStruct):
       Task.next_id_base = id_base
 
     # 32 bit timestamp (in 1/1000 second resolution)
-    time_base = (long(time.time() * 1000) & 0xFFFFFFFF) << 32
+    time_base = (long(time.time() * 1000) & 0x1FFFFFFF) << 32
 
-    return time_base + id_base
+    priority_prefix = self.max_priority - self.priority
+    # Prepend the priority so the messages stay sorted.
+    task_id = time_base | id_base
+    task_id |= priority_prefix << 61
+
+    return task_id
 
   @property
   def payload(self):
@@ -61,9 +73,7 @@ class GrrMessage(rdfvalue.RDFProtoStruct):
       # Now try to create the correct RDFValue.
       result_cls = self.classes.get(self.args_rdf_name, rdfvalue.RDFString)
 
-      result = result_cls(age=self.args_age)
-      result.ParseFromString(self.args)
-
+      result = result_cls(self.args, age=self.args_age)
       return result
 
   @payload.setter
@@ -115,36 +125,139 @@ class Flow(rdfvalue.RDFProtoStruct):
   aff4_object = None
 
 
-class DataObject(object):
+class DataObject(dict):
   """This class wraps a dict and provides easier access functions."""
-  data = None
-
-  def __init__(self, **kwargs):
-    object.__setattr__(self, "data", kwargs)
 
   def Register(self, item, value=None):
-    self.data[item] = value
+    self[item] = value
 
   def __setattr__(self, item, value):
-    self.data[item] = value
+    self[item] = value
 
   def __getattr__(self, item):
-    if item in self.__dict__:
-      return object.__getattr__(self, item)
-    if self.data is None:
-      raise AttributeError()
-    if item in self.data:
-      return self.data[item]
-    return getattr(self.data, item)
+    try:
+      return self[item]
+    except KeyError as e:
+      raise AttributeError(e)
+
+  def __dir__(self):
+    return sorted(self.keys()) + dir(self.__class__)
+
+  def __str__(self):
+    result = []
+    for k, v in self.items():
+      tmp = "  %s = " % k
+      try:
+        for line in utils.SmartUnicode(v).splitlines():
+          tmp += "    %s\n" % line
+      except Exception as e:  # pylint: disable=broad-except
+        tmp += "Error: %s\n" % e
+
+      result.append(tmp)
+
+    return "{\n%s}\n" % "".join(result)
+
+
+class UnknownObject(object):
+  """A placeholder for class instances that can not be unpickled."""
+
+  def __str__(self):
+    return "Unknown Object"
+
+
+class RobustUnpickler(pickle.Unpickler):
+  """A special unpickler we can use when there are errors in the pickle.
+
+  Due to code changes, sometime existing pickles in the data store can not be
+  restored - e.g. if one of the embedded objects is an instance of a class which
+  was renamed or moved. This pickler replaces these instances with the
+  UnknownObject() instance. This way some of the properies of old pickles can
+  still be seen in the UI. It is generally not safe to rely on the data if
+  errors are encountered.
+  """
+  # pylint: disable=invalid-name, broad-except
+  dispatch = pickle.Unpickler.dispatch.copy()
+
+  def load_reduce(self):
+    try:
+      pickle.Unpickler.load_reduce(self)
+    except Exception:
+      self.stack[-1] = UnknownObject()
+  dispatch[pickle.REDUCE] = load_reduce
+
+  def load_global(self):
+    try:
+      pickle.Unpickler.load_global(self)
+    except Exception:
+      self.append(UnknownObject)
+  dispatch[pickle.GLOBAL] = load_global
+  # pylint: enable=invalid-name, broad-except
+
+
+class FlowState(rdfvalue.RDFValue):
+  """The state of a running flow.
+
+  The Flow object can use the state to persist data structures between state
+  method execution. The FlowState is serialized by the flow machinery when not
+  needed.
+
+  The FlowRunner() also uses the flow's state to persist internal flow state
+  related variables - although the flow itself has no access to these. The
+  runner context is stored in our context parameter.
+
+  """
+  data_store_type = "bytes"
+  data = None
+
+  # If there were errors in unpickling this object, we note them in here.
+  errors = None
+
+  def __init__(self, initializer=None, age=None):
+    self.data = DataObject()
+    super(FlowState, self).__init__(initializer=initializer, age=age)
+
+  def ParseFromString(self, string):
+    try:
+      # Try to unpickle using the fast unpickler. This is the most common case.
+      self.data = cPickle.loads(string)
+    except Exception as e:  # pylint: disable=broad-except
+      # If an error occurs we try to use the more robust version to at least
+      # salvage some data. This could happen if an old version of the pickle is
+      # stored in the data store.
+      self.errors = e
+      try:
+        self.data = RobustUnpickler(StringIO.StringIO(string)).load()
+      except Exception as e:  # pylint: disable=broad-except
+        raise rdfvalue.DecodeError(e)
+
+  def SerializeToString(self):
+    return cPickle.dumps(self.data)
+
+  def Empty(self):
+    return not bool(self.data)
 
   def __len__(self):
     return len(self.data)
 
-  def __iter__(self):
-    return iter(self.data)
+  def get(self, item, default=None):  # pylint: disable=g-bad-name
+    return self.data.get(item, default)
 
-  def AsDict(self):
-    return self.data
+  def Register(self, item, value=None):
+    setattr(self.data, item, value)
+
+  def __setattr__(self, item, value):
+    # Existing class or instance members are assigned to normally.
+    if getattr(self.__class__, item, -1) != -1 or item in self.__dict__:
+      object.__setattr__(self, item, value)
+
+    elif item in self.data:
+      setattr(self.data, item, value)
+    else:
+      raise AttributeError(
+          "Can not assign to state without calling Register() first")
+
+  def __getattr__(self, item):
+    return getattr(self.data, item)
 
   def __str__(self):
     result = []
@@ -157,80 +270,13 @@ class DataObject(object):
 
     return "{\n%s}\n" % "".join(result)
 
-
-class FlowState(rdfvalue.RDFValue):
-  """The state of a running flow."""
-  data_store_type = "bytes"
-  data = None
-
-  def __init__(self, initializer=None, age=None):
-    object.__setattr__(self, "data", DataObject())
-    self.data.context = DataObject()
-    super(FlowState, self).__init__(initializer=initializer, age=age)
-
-  def ParseFromString(self, string):
-    self.data = pickle.loads(string)
-
-  def SerializeToString(self):
-    return pickle.dumps(self.data)
-
-  def AsDict(self):
-    result = self.data.AsDict().copy()
-    try:
-      result["context"] = result["context"].AsDict()
-    except AttributeError:
-      pass
-
-    return result
-
-  @property
-  def context(self):
-    return self.data.context
-
-  @context.setter
-  def context(self, context):
-    self.data.context = context
-
-  def Empty(self):
-    return len(self.data) == 1 and not self.data.context
-
-  def __len__(self):
-    return len(self.data)
-
-  def get(self, item, default=None):  # pylint: disable=g-bad-name
-    return self.data.get(item, default)
-
-  def Register(self, item, value=None):
-    setattr(self.data, item, value)
-
-  def __setattr__(self, item, value):
-    if item in self.data:
-      setattr(self.data, item, value)
-    else:
-      object.__setattr__(self, item, value)
-
-  def __getattr__(self, item):
-    if item in self.__dict__:
-      return object.__getattr__(self, item)
-    if self.data is None:
-      raise AttributeError()
-    return getattr(self.data, item)
-
-  def __str__(self):
-    result = []
-    for k, v in self.AsDict().items():
-      tmp = "  %s = " % k
-      for line in utils.SmartUnicode(v).splitlines():
-        tmp += "    %s\n" % line
-
-      result.append(tmp)
-
-    return "{\n%s}\n" % "".join(result)
-
   def __eq__(self, other):
     """Implement equality operator."""
     return (isinstance(other, self.__class__) and
             self.SerializeToString() == other.SerializeToString())
+
+  def __dir__(self):
+    return dir(self.data) + dir(self.__class__)
 
 
 class Notification(rdfvalue.RDFProtoStruct):
@@ -300,7 +346,7 @@ class ProgressGraph(rdfvalue.RDFString):
 
 
 class Task(rdfvalue.RDFProtoStruct):
-  """Tasks are scheduled on the TaskScheduler.
+  """Tasks are scheduled on the task scheduler.
 
   This class is DEPRECATED! It only exists here so we can render flows stored
   in the old format in the GUI. Do not use this anymore, GrrMessage now contains
@@ -363,7 +409,7 @@ class Task(rdfvalue.RDFProtoStruct):
 
   def SerializeToString(self):
     try:
-      self.value = self.payload.AsProto().SerializeToString()
+      self.value = self.payload.SerializeToString()
     except AttributeError:
       pass
 

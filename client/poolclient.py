@@ -15,10 +15,10 @@ from grr.client import client
 
 # pylint: disable=unused-import
 # Make sure we load the client plugins
-from grr.client import client_actions
 from grr.client import client_plugins
 # pylint: enable=unused-import
 
+from grr.client import comms
 from grr.client import vfs
 from grr.lib import config_lib
 from grr.lib import flags
@@ -85,8 +85,9 @@ def CreateClientPool(n):
     pass
 
   while len(clients) < n:
-    # Force the client to regenerate the RSA key pair each time.
-    clients.append(PoolGRRClient(private_key="Invalid"))
+    # Generate a new RSA key pair for each client.
+    key = rdfvalue.PEMPrivateKey.GenKey(bits=comms.ClientCommunicator.BITS)
+    clients.append(PoolGRRClient(private_key=key))
 
   # Start all the clients now.
   for c in clients:
@@ -128,6 +129,16 @@ def CreateClientPool(n):
     pass
 
 
+def CheckLocation():
+  """Checks that the poolclient is not accidentally ran against production."""
+  for url in config_lib.CONFIG["Client.control_urls"]:
+    if "staging" in url or "localhost" in url:
+      # This is ok.
+      return
+  logging.error("Poolclient should only be run against test or staging.")
+  exit()
+
+
 def main(unused_argv):
   config_lib.CONFIG.AddContext(
       "PoolClient Context",
@@ -137,10 +148,7 @@ def main(unused_argv):
 
   config_lib.CONFIG.SetWriteBack("/dev/null")
 
-  if ("staging" not in config_lib.CONFIG["Client.location"] and
-      "localhost" not in config_lib.CONFIG["Client.location"]):
-    logging.error("Poolclient should only be run against test or staging.")
-    exit()
+  CheckLocation()
 
   # Let the OS handler also handle sleuthkit requests since sleuthkit is not
   # thread safe.

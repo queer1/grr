@@ -13,24 +13,14 @@ A UserManager class has the following responsibilities :
 
 
 
-import getpass
 import logging
-import sys
 import time
 
 
-from grr.lib import config_lib
 from grr.lib import rdfvalue
 from grr.lib import registry
 from grr.lib import stats
-from grr.lib import utils
-
-config_lib.DEFINE_integer("ACL.cache_age", 600, "The number of seconds "
-                          "approval objects live in the cache.")
-
-config_lib.DEFINE_string("Datastore.security_manager",
-                         "NullAccessControlManager",
-                         "The ACL manager for controlling access to data.")
+from grr.proto import flows_pb2
 
 
 class Error(Exception):
@@ -61,82 +51,7 @@ class ExpiryError(Error):
   counter = "grr_expired_tokens"
 
 
-class BaseUserManager(object):
-  """User management class.
-
-  Provides basic functionality for managing users.
-
-  Note: This class is only meant for simple implementations. In a significant
-    GRR implementation it is expected that user management will be
-    handled outside of GRR using an SSO or directory service implementation.
-  """
-
-  __metaclass__ = registry.MetaclassRegistry
-
-  def CheckUserLabels(self, username, authorized_labels):
-    """Verify that the username has one of the authorized_labels set.
-
-    Args:
-       username: The name of the user.
-       authorized_labels: A list of string labels.
-
-    Returns:
-      True if the user has one of the authorized_labels set.
-
-    Raises:
-      RuntimeError: On bad parameters.
-    """
-    if not username or not authorized_labels:
-      raise RuntimeError("Bad CheckUserLabels call.")
-    for label in self.GetUserLabels(username):
-      if label in authorized_labels:
-        return True
-    return False
-
-  def GetUserLabels(self, username):
-    """Get a list of the labels assigned to user."""
-
-  def AddUserLabels(self, username, labels):
-    """Add the labels to the specified user."""
-    self.SetUserLabels(username, list(self.GetUserLabels(username)) + labels)
-
-  def SetUserLabels(self, username, labels):
-    """Overwrite the current set of labels with a list of labels."""
-
-  def MakeUserAdmin(self, username):
-    """Shortcut to add the Admin label to a specific user."""
-    self.AddUserLabels(username, ["admin"])
-
-  # pylint: disable=unused-argument
-  def AddUser(self, username, password=None, admin=True, labels=None):
-    """Add a user.
-
-    Args:
-      username: User name to create.
-      password: Password to set.
-      admin: Should the user be made an admin.
-      labels: List of additional labels to add to the user.
-
-    Raises:
-      RuntimeError: On invalid arguments.
-      NotSupportedError: If unimplemented.
-    """
-    raise NotSupportedError("AddUser not supported by %s" %
-                            self.__class__.__name__)
-
-  def UpdateUser(self, username, password=None, admin=True, labels=None):
-    """Update the properties of an existing user."""
-    self.AddUser(username, password=password, admin=admin, labels=labels)
-
-  def CheckUserAuth(self, username, auth_obj):
-    """Update the properties of an existing user."""
-    raise NotSupportedError("UpdateUser not supported by %s" %
-                            self.__class__.__name__)
-
-  # pylint: enable=unused-argument
-
-
-class BaseAccessControlManager(object):
+class AccessControlManager(object):
   """A class for managing access to data resources.
 
   This class is responsible for determining which users have access to each
@@ -147,19 +62,6 @@ class BaseAccessControlManager(object):
   """
 
   __metaclass__ = registry.MetaclassRegistry
-
-  user_manager_cls = BaseUserManager
-
-  def __init__(self, user_manager_cls=None):
-    """Init.
-
-    Args:
-      user_manager_cls: Class to use for managing users.
-    """
-    if user_manager_cls is None and self.user_manager_cls:
-      self.user_manager = self.user_manager_cls()
-    elif user_manager_cls:
-      self.user_manager = user_manager_cls()
 
   def CheckHuntAccess(self, token, hunt_urn):
     """Checks access to the given hunt.
@@ -231,9 +133,9 @@ class BaseAccessControlManager(object):
     logging.debug("Checking %s: %s for %s", token, subjects, requested_access)
     raise NotImplementedError()
 
-  def CheckUserLabels(self, username, authorized_labels):
-    """Verify that the username has the authorized_labels set."""
-    return self.user_manager.CheckUserLabels(username, authorized_labels)
+  def CheckUserLabels(self, username, authorized_labels, token=None):
+    """Subclasses verify that the username has all the authorized_labels set."""
+    raise NotImplementedError()
 
 
 class ACLInit(registry.InitHook):
@@ -254,72 +156,43 @@ class ACLInit(registry.InitHook):
 # where they are defined. This allows us to decouple the place of definition of
 # a class (which might be in a plugin) from its use which will reference this
 # module.
-BaseUserManager.classes = globals()
-BaseAccessControlManager.classes = globals()
+AccessControlManager.classes = globals()
 
 
-class ACLToken(object):
+class ACLToken(rdfvalue.RDFProtoStruct):
   """The access control token."""
+  protobuf = flows_pb2.ACLToken
 
-  is_emergency = False
+  # The supervisor flag enables us to bypass ACL checks. It can not be
+  # serialized or controlled externally.
+  supervisor = False
 
-  def __init__(self, username="", reason="", requested_access="r",
-               source_ips=None, process=None, expiry=None):
-    """Controls access to the data for the user.
-
-    This ACL token should be provided for any access to the data store. This
-    allows the data store to audit all access to data. Note that implementations
-    should implement a mechanism for authenticating tokens, so they can not be
-    forged.
-
-    Args:
-       username: The user which requires access to the data.
-       reason: The stated reason for the access (e.g. case name/id).
-       requested_access: The type of access this token is for.
-       source_ips: Optional list of source IPs of the request.
-       process: Optional name of the process issuing this token.
-       expiry: When does this token expire (seconds since epoch)? Use of this
-          token after this time will raise ExpiryError.
-    """
-    self.username = username or getpass.getuser()
-    self.reason = reason
-    self.requested_access = requested_access
-    self.source_ips = source_ips or []
-    self.process = process
-
-    # This special bit indicates a privileged token for internal use. When this
-    # bit is set, ACLs will be bypassed. There should be no way for an external
-    # user to set this flag. IMPORTANT: This flag does not serialize to the
-    # protobuf for the remote data store!
-    self.supervisor = False
-
-    # By default never expire.
-    if expiry is None:
-      expiry = sys.maxint
-
-    self.expiry = expiry
+  def Copy(self):
+    result = super(ACLToken, self).Copy()
+    result.supervisor = False
+    return result
 
   def CheckExpiry(self):
-    if time.time() > self.expiry:
+    if self.expiry and time.time() > self.expiry:
       raise ExpiryError("Token expired.")
 
   def __str__(self):
-    return "Token(%s:%s)" % (utils.SmartStr(self.username),
-                             utils.SmartStr(self.reason))
+    result = ""
+    if self.supervisor:
+      result = "******* SUID *******\n"
 
-  def Copy(self):
-    return ACLToken(username=self.username, reason=self.reason,
-                    requested_access=self.requested_access,
-                    source_ips=self.source_ips, process=self.process,
-                    expiry=self.expiry)
+    return result + super(ACLToken, self).__str__()
 
-  def ToRDFToken(self):
-    result = rdfvalue.AccessToken(
-        username=self.username,
-        reason=self.reason,
-        requested_access=self.requested_access,
-        expiry=long(self.expiry),
-        source_ips=self.source_ips)
-    if self.process:
-      result.process = self.process
+  def SetUID(self):
+    """Elevates this token to a supervisor token."""
+    result = self.Copy()
+    result.supervisor = True
+
+    return result
+
+  def RealUID(self):
+    """Returns the real token (without SUID) suitable for testing ACLs."""
+    result = self.Copy()
+    result.supervisor = False
+
     return result

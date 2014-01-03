@@ -17,10 +17,6 @@ from grr.lib import registry
 from grr.lib import stats
 
 
-config_lib.DEFINE_integer("Monitoring.stats_server_http_port", 0,
-                          "Port for varz monitoring server.")
-
-
 class StatsServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
   """Default stats server implementation."""
 
@@ -95,8 +91,9 @@ class StatsServerInit(registry.InitHook):
     """
 
     # Figure out which port to use.
-    port = config_lib.CONFIG["Monitoring.stats_server_http_port"]
+    port = config_lib.CONFIG["Monitoring.http_port"]
     if port != 0:
+      logging.info("Starting monitoring server on port %d.", port)
       # pylint: disable=g-import-not-at-top
       from grr.lib import local as local_overrides
       # pylint: enable=g-import-not-at-top
@@ -107,4 +104,5 @@ class StatsServerInit(registry.InitHook):
         stats_server = StatsServer(port)
 
       stats_server.Start()
-      logging.info("Monitoring Server started on port %d.", port)
+    else:
+      logging.info("Monitoring server disabled.")

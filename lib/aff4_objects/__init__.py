@@ -11,10 +11,11 @@ from grr.lib.aff4_objects import browser
 from grr.lib.aff4_objects import client_stats
 from grr.lib.aff4_objects import collections
 from grr.lib.aff4_objects import cronjobs
+from grr.lib.aff4_objects import filestore
+from grr.lib.aff4_objects import filetypes
 from grr.lib.aff4_objects import filters
 from grr.lib.aff4_objects import hunts
 from grr.lib.aff4_objects import network
-from grr.lib.aff4_objects import processes
 from grr.lib.aff4_objects import security
 from grr.lib.aff4_objects import software
 from grr.lib.aff4_objects import standard

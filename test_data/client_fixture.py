@@ -61,8 +61,6 @@ full_name: "Steve Whitmire"
 comment: "A Muppet"
 """],
         })),
-    # The following deliberately neglects to include proc so we can test if its
-    # picked up anyway.
     (u"/fs/os/c/regex.*?][{}--", ("VFSDirectory", {
         })),
     # This is unlinked in other VFSDirectory objects - tests if we correctly
@@ -3546,7 +3544,7 @@ pathspec {
  pathtype: REGISTRY
 }
 registry_data {
-  string: "%%ProgramFiles%%/Windows Sidebar/Sidebar.exe /autoRun"
+  string: "%%ProgramFiles%%\\Windows Sidebar\\Sidebar.exe /autoRun"
 }
 """
 })),
@@ -3562,7 +3560,7 @@ pathspec {
   path: "/HKEY_USERS/S-1-5-20/Software/Microsoft/Windows/CurrentVersion/Run/Sidebar"
 }
 registry_data {
-  string: "Sidebar.exe"
+  string: "%%TEMP%%\\Sidebar.exe"
 }
 """
 })),
@@ -3630,7 +3628,7 @@ registry_data {
 }
 """
 })),
-(u"/registry/HKEY_LOCAL_MACHINE/SYSTEM/ControlSet001/Control/TimeZoneInformation/TimeZoneKeyName", ("VFSFile", {
+(u"/registry/HKEY_LOCAL_MACHINE/SYSTEM/ControlSet001/Control/TimeZoneInformation/StandardName", ("VFSFile", {
 "aff4:stat":
 """
 st_mode: 32768
@@ -3639,7 +3637,7 @@ st_mtime: 0
 registry_type: REG_EXPAND_SZ
 pathspec {
   pathtype: REGISTRY
-  path: "/HKEY_LOCAL_MACHINE/SYSTEM/ControlSet001/Control/TimeZoneInformation/TimeZoneKeyName"
+  path: "/HKEY_LOCAL_MACHINE/SYSTEM/ControlSet001/Control/TimeZoneInformation/StandardName"
 }
 registry_data {
   string: "AlaskanStandardTime"
@@ -3743,47 +3741,20 @@ registry_data {
 }
 """
 })),
-(u"/C:/Windows", ("VFSDirectory", {
-"aff4:stat":
-"""
-st_mode: 16895
-st_ino: 10264
-st_dev: 51713
-st_nlink: 0
-st_uid: 0
-st_gid: 0
-st_size: 4096
-st_atime: 1299502220
-st_mtime: 1284154642
-st_ctime: 1299502221
-st_blocks: 16
-st_blksize: 4096
-st_rdev: 0
-pathspec {
-  pathtype: OS
-  path: "/C:/Windows"
-}
-"""
-})),
-(u"/C:/Windows/foo.exe", ("VFSFile", {
+
+(r"/registry/HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows NT/CurrentVersion/ProfileList/S-1-5-21-702227068-2140022151-3110739409-1000/ProfileImagePath", ("VFSFile", {
 "aff4:stat":
 """
 st_mode: 32768
-st_ino: 10260
-st_dev: 51713
-st_nlink: 0
-st_uid: 0
-st_gid: 0
-st_size: 4096
-st_atime: 1299502220
-st_mtime: 1284154642
-st_ctime: 1299502221
-st_blocks: 16
-st_blksize: 4096
-st_rdev: 0
+st_size: 12
+st_mtime: 0
+registry_type: REG_EXPAND_SZ
 pathspec {
-  pathtype: OS
-  path: "/C:/Windows/foo.exe"
+  pathtype: REGISTRY
+  path: "/HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows NT/CurrentVersion/ProfileList/S-1-5-21-702227068-2140022151-3110739409-1000/ProfileImagePath"
+}
+registry_data {
+  string: "C:\\Users\\jim"
 }
 """
 })),

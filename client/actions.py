@@ -93,22 +93,22 @@ class ActionPlugin(object):
 
     """
     args = None
-    if self.message.args_rdf_name:
-      if not self.in_rdfvalue:
-        raise RuntimeError("Did not expect arguments, got %s." %
-                           self.message.args_rdf_name)
-      if self.in_rdfvalue.__name__ != self.message.args_rdf_name:
-        raise RuntimeError("Unexpected arg type %s != %s." %
-                           self.message.args_rdf_name,
-                           self.in_rdfvalue.__name__)
-
-      # TODO(user): should be args = self.message.payload
-      args = rdfvalue.GrrMessage(self.message).payload
-
-    self.status = rdfvalue.GrrStatus(
-        status=rdfvalue.GrrStatus.ReturnedStatus.OK)
-
     try:
+      if self.message.args_rdf_name:
+        if not self.in_rdfvalue:
+          raise RuntimeError("Did not expect arguments, got %s." %
+                             self.message.args_rdf_name)
+
+        if self.in_rdfvalue.__name__ != self.message.args_rdf_name:
+          raise RuntimeError("Unexpected arg type %s != %s." %
+                             (self.message.args_rdf_name,
+                              self.in_rdfvalue.__name__))
+
+        args = self.message.payload
+
+      self.status = rdfvalue.GrrStatus(
+          status=rdfvalue.GrrStatus.ReturnedStatus.OK)
+
       # Only allow authenticated messages in the client
       if (self._authentication_required and
           self.message.auth_state !=
@@ -143,6 +143,7 @@ class ActionPlugin(object):
       self.SetStatus(rdfvalue.GrrStatus.ReturnedStatus.GENERIC_ERROR,
                      "%r: %s" % (e, e),
                      traceback.format_exc())
+
       if flags.FLAGS.debug:
         pdb.post_mortem()
 
@@ -194,6 +195,7 @@ class ActionPlugin(object):
                               response_id=self.response_id,
                               request_id=self.message.request_id,
                               message_type=message_type,
+                              task_id=self.message.task_id,
                               priority=self.priority,
                               require_fastpoll=self.require_fastpoll)
 

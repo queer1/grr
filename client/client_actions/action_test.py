@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- mode: python; encoding: utf-8 -*-
 
-# Copyright 2010 Google Inc. All Rights Reserved.
 """Test client actions."""
 
 
@@ -173,8 +172,14 @@ class ActionTest(test_lib.EmptyActionTest):
     old_listdir = os.listdir
 
     # Mock the open call
-    def MockedOpen(_):
-      return old_open(path)
+    def MockedOpen(requested_path):
+      # Any calls to open the wtmp get the mocked out version.
+      if "wtmp" in requested_path:
+        self.assertEqual(requested_path, "/var/log/wtmp")
+        return old_open(path)
+
+      # Everything else has to be opened normally.
+      return old_open(requested_path)
 
     __builtin__.open = MockedOpen
     os.listdir = lambda x: ["wtmp"]
@@ -187,6 +192,8 @@ class ActionTest(test_lib.EmptyActionTest):
 
     found = 0
     for result in results:
+      # This appears in ut_type RUN_LVL, not ut_type USER_PROCESS.
+      self.assertNotEqual("runlevel", result.username)
       if result.username == "user1":
         found += 1
         self.assertEqual(result.last_logon, 1296552099 * 1000000)

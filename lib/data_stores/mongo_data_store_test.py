@@ -3,6 +3,10 @@
 
 
 
+# pylint: disable=unused-import,g-bad-import-order
+from grr.lib import server_plugins
+# pylint: enable=unused-import,g-bad-import-order
+
 from grr.lib import access_control
 from grr.lib import config_lib
 from grr.lib import data_store
@@ -15,7 +19,8 @@ from grr.lib.data_stores import mongo_data_store
 class MongoTestMixin(object):
 
   def InitTable(self):
-    self.token = access_control.ACLToken("test", "Running tests")
+    self.token = access_control.ACLToken(username="test",
+                                         reason="Running tests")
     config_lib.CONFIG.Set("Mongo.db_name", "grr_test_%s" %
                           self.__class__.__name__)
     data_store.DB = mongo_data_store.MongoDataStore()

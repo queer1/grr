@@ -20,12 +20,14 @@ from grr.client import client_plugins
 
 from grr.lib import access_control
 from grr.lib import aff4_objects
+from grr.lib import client_compatibility
 from grr.lib import config_lib
 from grr.lib import data_stores
 from grr.lib import flow
 from grr.lib import hunts
 from grr.lib import local
 from grr.lib import stats
+from grr.lib import stats_store
 from grr.lib.flows import general
 
 from grr.server import server_plugins

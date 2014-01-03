@@ -166,7 +166,7 @@ grr.init = function() {
  */
 grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
                        opt_success_cb) {
-  var state = opt_state || grr.state;
+  var state = $.extend({}, grr.state, opt_state);
   var publishEvent = opt_publishEvent || 'tree_select';
 
   state.path = '/';
@@ -189,7 +189,6 @@ grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
         'type': grr.ajax_method,
         dataType: '*', // Let the server decide on the mime type.
         beforeSend: function(xhr) {
-          xhr.setRequestHeader('X-CSRFToken', $('#csrfmiddlewaretoken').val());
           grr.PushToAjaxQueue('#' + unique_id);
         },
         'data' : function(n) {
@@ -225,18 +224,15 @@ grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
 
   /* Bind the select event to the publish queue */
   tree.bind('select_node.jstree', function(event, data) {
-    var path = data.inst.get_path(data.rslt.obj).join('/');
-    var selected_id = $(data.rslt.obj).attr('id');
+    var path = data.rslt.obj.attr('path');
+    var selected_id = data.rslt.obj.attr('id');
     var update_hash = data.args[1];
 
     // Publish the full AFF4 path of the object the user clicked on.
-    var root = (state.aff4_root || '');
+    var root = (state.aff4_root || '/');
+    var new_path = (root + path).replace(/\/+/, '/');
 
-    // TODO(user): We really need a proper path normalization function.
-    if (root.charAt(root.length - 1) != '/') {
-      root += '/';
-    }
-    grr.publish(publishEvent, root + path, selected_id, update_hash);
+    grr.publish(publishEvent, new_path, selected_id, update_hash);
 
     // Selecting a node automatically opens it
     $(this).jstree('open_node', '#' + selected_id);
@@ -339,6 +335,10 @@ grr.subscribe = function(name, handle, domId) {
   new_queue.push(handle);
 
   grr.queue_[queue_name] = new_queue;
+
+  if (new_queue.length > 5) {
+    alert('Queue ' + queue_name + 'seems full');
+  }
 };
 
 /**
@@ -518,6 +518,7 @@ grr.table.scrollHandler = function(renderer, tbody, opt_state) {
   var loading_id = loading.attr('id');
   var value = loading.attr('data');
   var depth = loading.attr('depth');
+  var start_row = loading.attr('start_row');
 
   $('.table_loading', tbody).each(function() {
     loading_offset = $(this).offset();
@@ -527,10 +528,16 @@ grr.table.scrollHandler = function(renderer, tbody, opt_state) {
       // row.
       $(elem).removeClass('table_loading');
 
-      var previous_row_id = (tbody.find('tr[row_id]').last().attr('row_id') ||
-          -1);
-      var next_row = parseInt(previous_row_id) + 1;
-      var state = $.extend({start_row: next_row}, grr.state, opt_state);
+      var next_row;
+      if (start_row == undefined) {
+        var previous_row_id = (tbody.find('tr[row_id]').last().attr('row_id') ||
+            -1);
+        next_row = parseInt(previous_row_id) + 1;
+      } else {
+        next_row = start_row;
+      }
+      var state = $.extend({start_row: next_row, value: value, depth: depth},
+                           grr.state, opt_state);
       var filter = tbody.parent().find('th[filter]');
       var sort = tbody.parent().find('th[sort]');
 
@@ -541,9 +548,6 @@ grr.table.scrollHandler = function(renderer, tbody, opt_state) {
       if (sort.length && sort.attr('sort')) {
         state.sort = sort.text() + ':' + sort.attr('sort');
       }
-
-      state['value'] = value;
-      state['depth'] = depth;
 
       // Insert the new data after the table loading message, and wipe it.
       grr.update(renderer, loading_id, state,
@@ -692,7 +696,7 @@ grr.table.newTable = function(renderer, domId, unique, opt_state) {
 
   grr.subscribe('timer', function() {
     grr.table.scrollHandler(renderer, me, opt_state);
-  }, domId);
+  }, unique);
 };
 
 /**
@@ -800,12 +804,20 @@ grr._update = function(renderer, domId, opt_state, on_success, inflight_key,
     },
     error: function(jqXHR) {
       if (grr.GetFromAjaxQueue(inflight_key) === jqXHR) {
+        if (jqXHR.status == 500) {
+          var data = jqXHR.responseText;
+          data = $.parseJSON(data.substring(4, data.length));
+        } else {
+          var data = {message: 'Server Error',
+                      traceback: jqXHR.responseText};
+        }
+
         if (!on_error) {
-          grr.publish('grr_messages', 'Server Error');
-          grr.publish('grr_traceback', jqXHR.response);
+          grr.publish('grr_messages', data.message);
+          grr.publish('grr_traceback', data.traceback);
         }
         else {
-          on_error(jqXHR);
+          on_error(data);
         }
       }
     },
@@ -842,9 +854,11 @@ grr._update = function(renderer, domId, opt_state, on_success, inflight_key,
  *     we use the domId.
  * @param {Function=} on_error If provided this function will be called on
  *     errors.
+ * @param {string} method_name If provided we call this method (default
+ * RenderAjax).
  */
 grr.update = function(renderer, domId, opt_state, on_success, inflight_key,
-                      on_error) {
+                      on_error, method_name) {
   if (!on_success) {
     on_success = function(data) {
       $('#' + domId).html(data);
@@ -852,7 +866,7 @@ grr.update = function(renderer, domId, opt_state, on_success, inflight_key,
   }
 
   grr._update(renderer, domId, opt_state, on_success, inflight_key,
-              on_error, 'RenderAjax');
+              on_error, method_name || 'RenderAjax');
 };
 
 /**
@@ -880,32 +894,6 @@ grr.layout = function(renderer, domId, opt_state, on_success) {
               'Layout');
 };
 
-/**
- * Function sets up event handlers on text elements.
- *
- * @param {string} domId The element we attach the events to.
- * @param {string} queue The name of the queue to send key down
- *     events to.
-*/
-grr.installEventsForText = function(domId, queue) {
-  var node = $('#' + domId);
-
-  // Stops event bubbling
-  var blocker = function(event) {
-    event.stopPropagation();
-    node.focus();
-  };
-
-  // Install events on this node.
-  node.keyup(function(event) {
-    grr.publish(queue, this.value);
-    blocker(event);
-  });
-
-  // Block bubbling of these events.
-  node.mousedown(blocker);
-  node.click(blocker);
-};
 
 /**
  * Create the popup menu dialog.
@@ -958,6 +946,9 @@ grr.submit = function(renderer, formId, resultId, opt_state,
     if (name && value) {
 
       if (this.type == 'checkbox') {
+        // Check boxes need to be read like this.
+        value = $(this).attr('checked') ? 'true' : 'false';
+
         // Multiple checkboxes can be concatenated to the same name.
         if (!(name in new_state)) {
           new_state[name] = value;
@@ -1402,7 +1393,7 @@ grr.textview.TextViewer = function(renderer, domId, default_codec, state) {
 
     // Add handlers for if someone updates the values manually.
     $('#text_encoding').change(function() {
-      grr.textview.Update(renderer, domId);
+      grr.textview.Update(renderer, domId, state);
     });
     $('#text_viewer_offset').change(function() {
       $('#text_viewer_slider').slider('values', 0, $(this).val());
@@ -1503,10 +1494,11 @@ grr.formNoneHandler = function(node) {
  * @param {string} formId The input form with the file parameter.
  * @param {string} progressId Div to write progress to.
  * @param {function} successHandler Function to call on success.
+ * @param {function} errorHandler Function to call on error.
  * @param {Object} state is the state we use for send to our renderer.
  */
 grr.uploadHandler = function(renderer, formId, progressId, successHandler,
-                             state) {
+                             errorHandler, state) {
   var formData = new FormData($('#' + formId)[0]);
 
   // Include our state in the form post.
@@ -1532,6 +1524,7 @@ grr.uploadHandler = function(renderer, formId, progressId, successHandler,
       return myXhr;
     },
     success: successHandler,
+    error: errorHandler,
     data: formData,
     //Tell JQuery not to process data or worry about content-type.
     cache: false,
@@ -1615,8 +1608,9 @@ grr.getCookie = function(name) {
  */
 grr.enableSearchHelp = function(clickNode) {
   var help_content = 'Search by hostname, username, id or MAC<br/>' +
-      'Limit scope using mac: host: fqdn: or user:<br/>e.g. user:sham<br/>' +
-      'Regex is supported<br/> e.g. test1[2-5].*\.example.com$';
+      'Limit scope using mac: host: label: fqdn: or user:<br/>e.g.' +
+      ' user:sham<br/>Regex is supported<br/> e.g. test1[2-5].*\.' +
+      'example.com$';
   var popover_opts = {'placement': 'bottom',
                       'title': help_content,
                       'container': 'body',

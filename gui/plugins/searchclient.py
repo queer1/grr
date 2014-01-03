@@ -1,13 +1,11 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
-
 """This plugin renders the client search page."""
 import time
 
 from django.utils import datastructures
 
 from grr.gui import renderers
-
+from grr.gui.plugins import semantic
 from grr.lib import access_control
 from grr.lib import aff4
 from grr.lib import rdfvalue
@@ -45,10 +43,11 @@ class ContentView(renderers.Splitter2WayVertical):
 
 def FormatLastSeenTime(age):
 
+  age = rdfvalue.RDFDatetime(age)
   if int(age) == 0:
     return "Never"
 
-  time_last_seen = (rdfvalue.RDFDatetime().Now() - int(age)) / 1e6
+  time_last_seen = int(rdfvalue.RDFDatetime().Now() - age)
 
   if time_last_seen < 60:
     return "%d seconds ago" % int(time_last_seen)
@@ -88,12 +87,12 @@ Status: {{this.icon|safe}}
       # Also check for proper access.
       aff4.FACTORY.Open(client.urn.Add("fs"), token=request.token)
 
-      self.icon = OnlineStateIcon(age).RawHTML()
+      self.icon = OnlineStateIcon(age).RawHTML(request)
       self.last_seen_msg = FormatLastSeenTime(age)
 
       ip = client.Get(client.Schema.CLIENT_IP)
       (status, description) = utils.RetrieveIPInfo(ip)
-      self.ip_icon = IPStatusIcon(status).RawHTML()
+      self.ip_icon = IPStatusIcon(status).RawHTML(request)
       self.ip_description = description
 
     return super(StatusRenderer, self).Layout(request, response)
@@ -231,6 +230,9 @@ class Navigator(renderers.TemplateRenderer):
     # Introspect all the categories
     for cls in self.classes.values():
       try:
+        if not aff4.issubclass(cls, renderers.Renderer):
+          continue
+
         cls.CheckAccess(request)
       except access_control.UnauthorizedAccess:
         continue
@@ -271,20 +273,21 @@ class Navigator(renderers.TemplateRenderer):
 
     super(Navigator, self).Layout(request, response)
     if self.unauthorized:
-      renderers.Renderer.NewPlugin("UnauthorizedRenderer")().Layout(
+      renderers.Renderer.GetPlugin("UnauthorizedRenderer")().Layout(
           request, response, exception=e)
 
     return response
 
 
-class OnlineStateIcon(renderers.RDFValueRenderer):
+class OnlineStateIcon(semantic.RDFValueRenderer):
   """Render the online state by using an icon."""
 
   cls = "vertical_aligned"
 
   layout_template = renderers.Template("""
 <img class="grr-icon-small {{this.cls|escape}}"
-     src="/static/images/{{this.icon|escape}}"/>""")
+     src="/static/images/{{this.icon|escape}}"
+     title="{{this.last_seen_str|escape}}"/>""")
 
   # Maps the flow states to icons we can show
   state_map = {"15m": "online.png",
@@ -292,7 +295,9 @@ class OnlineStateIcon(renderers.RDFValueRenderer):
                "offline": "offline.png"}
 
   def Layout(self, request, response):
+    """Render the state icon."""
     time_last_seen = time.time() - (self.proxy / 1e6)
+    self.last_seen_str = FormatLastSeenTime(self.proxy)
     if time_last_seen < 60 * 15:
       self.icon = self.state_map["15m"]
     elif time_last_seen < 60 * 60 * 24:
@@ -303,7 +308,7 @@ class OnlineStateIcon(renderers.RDFValueRenderer):
     return super(OnlineStateIcon, self).Layout(request, response)
 
 
-class IPStatusIcon(renderers.RDFValueRenderer):
+class IPStatusIcon(semantic.RDFValueRenderer):
   """Renders the ip status (internal, external) icon."""
 
   cls = "vertical_aligned"
@@ -355,15 +360,20 @@ class HostTable(renderers.TableRenderer):
 
   def __init__(self, **kwargs):
     renderers.TableRenderer.__init__(self, **kwargs)
-    self.AddColumn(renderers.RDFValueColumn("Online", width="40px",
-                                            renderer=CenteredOnlineStateIcon))
-    self.AddColumn(renderers.AttributeColumn("subject", width="13em"))
-    self.AddColumn(renderers.AttributeColumn("Host", width="13em"))
-    self.AddColumn(renderers.AttributeColumn("Version", width="20%"))
-    self.AddColumn(renderers.AttributeColumn("MAC", width="10%"))
-    self.AddColumn(renderers.AttributeColumn("Usernames", width="20%"))
-    self.AddColumn(renderers.AttributeColumn("Install", width="15%"))
-    self.AddColumn(renderers.AttributeColumn("Clock", width="15%"))
+    self.AddColumn(semantic.RDFValueColumn("Online", width="40px",
+                                           renderer=CenteredOnlineStateIcon))
+    self.AddColumn(semantic.AttributeColumn("subject", width="13em"))
+    self.AddColumn(semantic.AttributeColumn("Host", width="13em"))
+    self.AddColumn(semantic.AttributeColumn("Version", width="20%"))
+    self.AddColumn(semantic.AttributeColumn("MAC", width="10%"))
+    self.AddColumn(semantic.AttributeColumn("Usernames", width="20%"))
+    self.AddColumn(semantic.AttributeColumn("FirstSeen", width="15%",
+                                            header="First Seen"))
+    self.AddColumn(semantic.AttributeColumn("Install", width="15%",
+                                            header="OS Install Date"))
+    self.AddColumn(semantic.AttributeColumn("Labels", width="8%"))
+    self.AddColumn(semantic.AttributeColumn("Clock", width="15%",
+                                            header="Last Checkin"))
 
   @renderers.ErrorHandler()
   def Layout(self, request, response):
@@ -384,9 +394,11 @@ class HostTable(renderers.TableRenderer):
     if not query_string:
       raise RuntimeError("A query string must be provided.")
 
-    result_set = search.SearchClients(query_string, start=start,
-                                      max_results=end-start,
-                                      token=request.token)
+    result_urns = search.SearchClients(query_string, start=start,
+                                       max_results=end-start,
+                                       token=request.token)
+    result_set = aff4.FACTORY.MultiOpen(result_urns, token=request.token)
+
     self.message = "Searched for %s" % query_string
 
     for child in result_set:

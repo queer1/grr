@@ -2,13 +2,32 @@
 
 
 from grr.lib import access_control
-from grr.lib import config_lib
+from grr.lib import aff4
 from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib.aff4_objects import user_managers
 
 
-class CheckAccessHelperTest(test_lib.GRRBaseTest):
+class GRRUserTest(test_lib.AFF4ObjectTest):
+  def testUserPasswords(self):
+    with aff4.FACTORY.Create("aff4:/users/test", "GRRUser",
+                             token=self.token) as user:
+      user.SetPassword("hello")
+
+    user = aff4.FACTORY.Open(user.urn, token=self.token)
+
+    self.assertFalse(user.CheckPassword("goodbye"))
+    self.assertTrue(user.CheckPassword("hello"))
+
+  def testLabels(self):
+    with aff4.FACTORY.Create("aff4:/users/test", "GRRUser",
+                             token=self.token) as user:
+      user.SetLabels("hello", "world")
+    user = aff4.FACTORY.Open(user.urn, token=self.token)
+    self.assertListEqual(["hello", "world"], user.GetLabels())
+
+
+class CheckAccessHelperTest(test_lib.AFF4ObjectTest):
   def setUp(self):
     super(CheckAccessHelperTest, self).setUp()
     self.helper = user_managers.CheckAccessHelper("test")
@@ -81,49 +100,108 @@ class CheckAccessHelperTest(test_lib.GRRBaseTest):
                       self.token)
     self.assertTrue(self.helper.CheckAccess(self.subject, self.token))
 
-  def testUserManagement(self):
+  def Ok(self, subject, access="r"):
+    self.assertTrue(
+        self.access_manager.CheckDataStoreAccess(self.token, [subject], access))
 
-    config_lib.CONFIG.Set("Users.authorization", "")
-    um = user_managers.ConfigBasedUserManager()
+  def NotOk(self, subject, access="r"):
+    self.assertRaises(
+        access_control.UnauthorizedAccess,
+        self.access_manager.CheckDataStoreAccess,
+        self.token, [subject], access)
 
-    # Make sure we start from a clean state.
-    self.assertEquals(len(um._user_cache), 0)
+  def testReadSomePaths(self):
+    """Tests some real world paths."""
+    self.access_manager = user_managers.FullAccessControlManager()
+    access = "r"
 
-    um.AddUser("admin", password="admin", admin=True)
+    self.Ok("aff4:/", access)
+    self.Ok("aff4:/users", access)
+    self.NotOk("aff4:/users/randomuser", access)
 
-    # There should be one user now.
-    self.assertEquals(len(um._user_cache), 1)
+    self.Ok("aff4:/blobs", access)
+    self.Ok("aff4:/blobs/12345678", access)
 
-    # Make sure we can authenticate.
-    class MyAuthObj(object):
-      pass
-    auth_obj = MyAuthObj()
-    auth_obj.user_provided_hash = "admin"
-    self.assertTrue(um.CheckUserAuth("admin", auth_obj))
+    self.Ok("aff4:/FP", access)
+    self.Ok("aff4:/FP/12345678", access)
 
-    # Change the password for the existing user.
-    um.AddUser("admin", password="new_pwd", admin=True)
+    self.Ok("aff4:/files", access)
+    self.Ok("aff4:/files/12345678", access)
 
-    # There should still only be one user.
-    self.assertEquals(len(um._user_cache), 1)
+    self.Ok("aff4:/ACL", access)
+    self.Ok("aff4:/ACL/randomuser", access)
 
-    # Check old password, should not work.
-    self.assertFalse(um.CheckUserAuth("admin", auth_obj))
+    self.Ok("aff4:/stats", access)
+    self.Ok("aff4:/stats/FileStoreStats", access)
 
-    # Try the new password.
-    auth_obj.user_provided_hash = "new_pwd"
-    self.assertTrue(um.CheckUserAuth("admin", auth_obj))
+    self.Ok("aff4:/config", access)
+    self.Ok("aff4:/config/drivers", access)
+    self.Ok("aff4:/config/drivers/windows/memory/winpmem.amd64.sys", access)
 
-    # Now add a second user but do not provide a password.
-    self.assertRaises(RuntimeError, um.AddUser, ("johndoe"))
+    self.Ok("aff4:/flows", access)
+    self.Ok("aff4:/flows/W:12345678", access)
 
-    # Ok, lets provide one.
-    um.AddUser("johndoe", password="jane", labels=["label1", "label2"],
-               admin=True)
+    self.Ok("aff4:/hunts", access)
+    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456", access)
+    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456/W:AAAAAAAA", access)
 
-    # There should be two now.
-    self.assertEquals(len(um._user_cache), 2)
+    self.Ok("aff4:/cron", access)
+    self.Ok("aff4:/cron/OSBreakDown", access)
 
-    # Make sure the admin label got added.
-    self.assertEquals(um._user_cache["johndoe"]["labels"],
-                      ["admin", "label1", "label2"])
+    self.Ok("aff4:/crashes", access)
+    self.Ok("aff4:/crashes/Stream", access)
+
+    self.Ok("aff4:/audit", access)
+    self.Ok("aff4:/audit/log", access)
+
+    self.Ok("aff4:/C.0000000000000001", access)
+    self.NotOk("aff4:/C.0000000000000001/fs/os", access)
+    self.NotOk("aff4:/C.0000000000000001/flows/W:12345678", access)
+
+    self.Ok("aff4:/tmp", access)
+    self.Ok("aff4:/tmp/C8FAFC0F", access)
+
+  def testQuerySomePaths(self):
+    """Tests some real world paths."""
+    self.access_manager = user_managers.FullAccessControlManager()
+    access = "rq"
+
+    self.NotOk("aff4:/", access)
+    self.NotOk("aff4:/users", access)
+    self.NotOk("aff4:/users/randomuser", access)
+
+    self.NotOk("aff4:/blobs", access)
+
+    self.NotOk("aff4:/FP", access)
+
+    self.NotOk("aff4:/files", access)
+    self.Ok("aff4:/files/hash/generic/sha256/" + "a" * 64, access)
+
+    self.Ok("aff4:/ACL", access)
+    self.Ok("aff4:/ACL/randomuser", access)
+
+    self.NotOk("aff4:/stats", access)
+
+    self.Ok("aff4:/config", access)
+    self.Ok("aff4:/config/drivers", access)
+    self.Ok("aff4:/config/drivers/windows/memory/winpmem.amd64.sys", access)
+
+    self.NotOk("aff4:/flows", access)
+    self.Ok("aff4:/flows/W:12345678", access)
+
+    self.Ok("aff4:/hunts", access)
+    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456", access)
+    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456/W:AAAAAAAA", access)
+
+    self.Ok("aff4:/cron", access)
+    self.Ok("aff4:/cron/OSBreakDown", access)
+
+    self.NotOk("aff4:/crashes", access)
+
+    self.NotOk("aff4:/audit", access)
+
+    self.Ok("aff4:/C.0000000000000001", access)
+    self.NotOk("aff4:/C.0000000000000001/fs/os", access)
+    self.NotOk("aff4:/C.0000000000000001/flows", access)
+
+    self.NotOk("aff4:/tmp", access)

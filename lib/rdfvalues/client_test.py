@@ -26,7 +26,7 @@ class UserTests(test_base.RDFValueTestCase):
     return result
 
   def testCompatibility(self):
-    proto = jobs_pb2.UserAccount(username="user1")
+    proto = jobs_pb2.User(username="user1")
     proto.special_folders.desktop = "User Desktop 1"
 
     serialized = proto.SerializeToString()
@@ -50,7 +50,7 @@ class UserTests(test_base.RDFValueTestCase):
     self.assertEqual(type(fast_proto.last_logon), rdfvalue.RDFDatetime)
 
     # Check that this is backwards compatible with the old protobuf library.
-    proto = jobs_pb2.UserAccount()
+    proto = jobs_pb2.User()
     proto.ParseFromString(fast_proto.SerializeToString())
 
     # Old implementation should just see the last_logon field as an integer.
@@ -62,3 +62,29 @@ class UserTests(test_base.RDFValueTestCase):
     fast_proto = rdfvalue.User(serialized_data)
     self.assertEqual(fast_proto.last_logon, 1365177603180131)
     self.assertEqual(type(fast_proto.last_logon), rdfvalue.RDFDatetime)
+
+  def testPrettyPrintMode(self):
+
+    for mode, result in [
+        (0775, "-rwxrwxr-x"),
+        (075, "----rwxr-x"),
+        (0, "----------"),
+        # DIR
+        (040775, "drwxrwxr-x"),
+        # SUID
+        (35232, "-rwSr-----"),
+        # GID
+        (34208, "-rw-r-S---"),
+        # CHR
+        (9136, "crw-rw---T"),
+        # BLK
+        (25008, "brw-rw----"),
+        # Socket
+        (49663, "srwxrwxrwx"),
+        # Sticky
+        (33791, "-rwxrwxrwt"),
+        # Sticky, not x
+        (33784, "-rwxrwx--T"),
+        ]:
+      value = rdfvalue.StatMode(mode)
+      self.assertEqual(unicode(value), result)

@@ -13,7 +13,6 @@ import time
 import zlib
 
 
-from M2Crypto import EVP
 import psutil
 
 import logging
@@ -25,33 +24,12 @@ from grr.client.client_actions import tempfiles
 from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import rdfvalue
-from grr.lib import type_info
 from grr.lib import utils
+from grr.lib.rdfvalues import crypto
 
 
 # We do not send larger buffers than this:
 MAX_BUFFER_SIZE = 640*1024
-
-
-config_lib.CONFIG.AddOption(type_info.PEMPublicKey(
-    name="Client.executable_signing_public_key",
-    description="public key for verifying executable signing."))
-
-config_lib.CONFIG.AddOption(type_info.PEMPrivateKey(
-    name="PrivateKeys.executable_signing_private_key",
-    description="Private keys for signing executables. NOTE: This "
-    "key is usually kept offline and is thus not present in the "
-    "configuration file."))
-
-config_lib.CONFIG.AddOption(type_info.PEMPublicKey(
-    name="Client.driver_signing_public_key",
-    description="public key for verifying driver signing."))
-
-config_lib.CONFIG.AddOption(type_info.PEMPrivateKey(
-    name="PrivateKeys.driver_signing_private_key",
-    description="Private keys for signing drivers. NOTE: This "
-    "key is usually kept offline and is thus not present in the "
-    "configuration file."))
 
 
 class ReadBuffer(actions.ActionPlugin):
@@ -179,7 +157,7 @@ class CopyPathToFile(actions.ActionPlugin):
     self.src_fd.Seek(args.offset)
     offset = self.src_fd.Tell()
 
-    self.length = args.length or sys.maxint
+    self.length = args.length or (1024 ** 4)  # 1 TB
 
     self.written = 0
     suffix = ".gz" if args.gzip_output else ""
@@ -411,10 +389,10 @@ class ExecutePython(actions.ActionPlugin):
     # The execed code can assign to this variable if it wants to return data.
     magic_return_str = ""
     logging.debug("exec for python code %s", args.python_code.data[0:100])
-    # pylint: disable=exec-statement,unused-variable
+    # pylint: disable=exec-used,unused-variable
     py_args = args.py_args.ToDict()
     exec(args.python_code.data)
-    # pylint: enable=exec-statement,unused-variable
+    # pylint: enable=exec-used,unused-variable
     time_used = time.time() - time_start
     # We have to return microseconds.
     result = rdfvalue.ExecutePythonResponse(
@@ -441,14 +419,6 @@ class ListProcesses(actions.ActionPlugin):
   """This action lists all the processes running on a machine."""
   in_rdfvalue = None
   out_rdfvalue = rdfvalue.Process
-
-  states = {
-      "UNKNOWN": rdfvalue.NetworkConnection.State.UNKNOWN,
-      "LISTEN": rdfvalue.NetworkConnection.State.LISTEN,
-      "ESTABLISHED": rdfvalue.NetworkConnection.State.ESTAB,
-      "TIME_WAIT": rdfvalue.NetworkConnection.State.TIME_WAIT,
-      "CLOSE_WAIT": rdfvalue.NetworkConnection.State.CLOSE_WAIT,
-      }
 
   def Run(self, unused_arg):
     # psutil will cause an active loop on Windows 2000
@@ -533,19 +503,28 @@ class ListProcesses(actions.ActionPlugin):
       try:
         for c in proc.get_connections():
           conn = response.connections.Append(family=c.family,
-                                             type=c.type)
+                                             type=c.type,
+                                             pid=proc.pid)
 
-          if c.status in self.states:
-            conn.state = self.states[c.status]
-          elif c.status:
+          try:
+            conn.state = c.status
+          except ValueError:
             logging.info("Encountered unknown connection status (%s).",
                          c.status)
 
-          conn.local_address.ip, conn.local_address.port = c.local_address
+          try:
+            conn.local_address.ip, conn.local_address.port = c.laddr
 
-          # Could be in state LISTEN.
-          if c.remote_address:
-            conn.remote_address.ip, conn.remote_address.port = c.remote_address
+            # Could be in state LISTEN.
+            if c.raddr:
+              conn.remote_address.ip, conn.remote_address.port = c.raddr
+          except AttributeError:
+            conn.local_address.ip, conn.local_address.port = c.local_address
+
+            # Could be in state LISTEN.
+            if c.remote_address:
+              (conn.remote_address.ip,
+               conn.remote_address.port) = c.remote_address
 
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
@@ -561,7 +540,6 @@ class SendFile(actions.ActionPlugin):
   out_rdfvalue = rdfvalue.StatEntry
 
   BLOCK_SIZE = 1024 * 1024 * 10  # 10 MB
-  OP_ENCRYPT = 1
 
   def Send(self, sock, msg):
     totalsent = 0
@@ -578,14 +556,6 @@ class SendFile(actions.ActionPlugin):
     # Open the file.
     fd = vfs.VFSOpen(args.pathspec)
 
-    key = args.key
-    if len(key) != 16:
-      raise RuntimeError("Invalid key length (%d)." % len(key))
-
-    iv = args.iv
-    if len(iv) != 16:
-      raise RuntimeError("Invalid iv length (%d)." % len(iv))
-
     if args.address_family == rdfvalue.NetworkAddress.Family.INET:
       family = socket.AF_INET
     elif args.address_family == rdfvalue.NetworkAddress.Family.INET6:
@@ -600,16 +570,17 @@ class SendFile(actions.ActionPlugin):
     except socket.error as e:
       raise RuntimeError(str(e))
 
-    cipher = EVP.Cipher(alg="aes_128_cbc", key=key, iv=iv, op=self.OP_ENCRYPT)
+    cipher = crypto.AES128CBCCipher(args.key, args.iv,
+                                    crypto.Cipher.OP_ENCRYPT)
 
     while True:
       data = fd.read(self.BLOCK_SIZE)
       if not data:
         break
-      self.Send(s, cipher.update(data))
+      self.Send(s, cipher.Update(data))
       # Send heartbeats for long files.
       self.Progress()
-    self.Send(s, cipher.final())
+    self.Send(s, cipher.Final())
     s.close()
 
     self.SendReply(fd.Stat())

@@ -3,6 +3,7 @@
 
 
 
+import threading
 import urllib
 
 from grr.lib import aff4
@@ -11,7 +12,8 @@ from grr.lib import email_alerts
 from grr.lib import rdfvalue
 from grr.lib import registry
 from grr.lib import rendering
-from grr.lib import type_info
+from grr.lib import utils
+from grr.proto import flows_pb2
 
 
 class HuntOutputPlugin(object):
@@ -26,49 +28,103 @@ class HuntOutputPlugin(object):
 
   __metaclass__ = registry.MetaclassRegistry
 
-  output_typeinfo = type_info.TypeDescriptorSet()
+  name = ""
   description = ""
-  args = {}
+  args_type = None
 
-  def __init__(self, hunt_obj, *unused_args, **kw):
-    self.token = hunt_obj.token
-    for name, value in self.output_typeinfo.ParseArgs(kw):
-      self.args[name] = value
+  def __init__(self, collection_urn, args=None, token=None, state=None):
+    """HuntOutputPlugin constructor.
 
-    if kw:
-      raise type_info.UnknownArg("%s: Args %s not known" % (
-          self.__class__.__name__, kw.keys()))
+    HuntOutputPlugin constructor is called during StartHuntFlow and therefore
+    runs with security checks enabled (if they're enabled in the config).
+    Therefore it's a bad idea to write anything to AFF4 in the constructor.
 
-  def ProcessResponse(self, response, client_id):
-    pass
+    Args:
+      collection_urn: URN of the collection which results are going to be
+                      processed.
+      args: This plugin's arguments.
+      token: Security token.
+      state: Instance of rdfvalue.FlowState. Represents plugin's state. If this
+             is passed, no initialization will be performed, only the state will
+             be applied.
+    Raises:
+      ValueError: when state argument is passed together with args or token
+                  arguments.
+    """
+    if state and (token or args):
+      raise ValueError("'state' argument can't be passed together with 'args' "
+                       "or 'token'.")
+
+    if not state:
+      self.state = state or rdfvalue.FlowState()
+      self.state.Register("collection_urn", collection_urn)
+      self.state.Register("args", args)
+      self.state.Register("token", token)
+      self.Initialize()
+    else:
+      self.state = state
+
+    self.args = self.state.args
+    self.token = self.state.token
+
+    self.lock = threading.RLock()
+
+  def Initialize(self):
+    """Initializes the hunt output plugin.
+
+    Initialize() is called when hunt is created. It can be used to register
+    state variables. It's called on the worker, so no security checks apply.
+    """
+
+  def ProcessResponses(self, responses):
+    """Processes bunch of responses.
+
+    Multiple ProcessResponses() calls can be done in a row. They're *always*
+    followed by a Flush() call. ProcessResponses() is called on the worker,
+    so no security checks apply.
+
+    NOTE: this method should be thread-safe as it may be called from multiple
+    threads to improve hunt output performance.
+
+    Args:
+      responses: GrrMessages from the hunt results collection.
+    """
+    raise NotImplementedError()
 
   def Flush(self):
+    """Flushes the output plugin's state.
+
+    Flush is *always* called after a series of ProcessResponses() calls.
+    Flush() is called on the worker, so no security checks apply.
+
+    NOTE: This method doesn't have to be thread-safe as it's called after all
+    ProcessResponses() calls are complete.
+    """
     pass
 
 
+# TODO(user): remove as soon as we don't care about old hunts with pickled
+# CollectionPluginArgs and CollectionPlugin.
+class CollectionPluginArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.CollectionPluginArgs
+
+
+# TODO(user): remove as soon as we don't care about old hunts with pickled
+# CollectionPluginArgs and CollectionPlugin.
 class CollectionPlugin(HuntOutputPlugin):
   """An output plugin that stores the results in a collection."""
 
   description = "Store results in a collection."
+  args_type = CollectionPluginArgs
+  # Making this class abstract, so that it doesn't show up in the UI
+  __abstract = True  # pylint: disable=invalid-name
 
-  def __init__(self, hunt_obj, *args, **kw):
-    super(CollectionPlugin, self).__init__(hunt_obj, *args, **kw)
+  def ProcessResponses(self, responses):
+    pass
 
-    # The results will be written to this collection.
-    self.collection = aff4.FACTORY.Create(
-        hunt_obj.urn.Add("Results"), "RDFValueCollection",
-        mode="rw", token=self.token)
 
-  def ProcessResponse(self, response, client_id):
-    msg = rdfvalue.GrrMessage(payload=response)
-    msg.source = client_id
-    self.collection.Add(msg)
-
-  def Flush(self):
-    self.collection.Flush()
-
-  def GetCollection(self):
-    return self.collection
+class EmailPluginArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.EmailPluginArgs
 
 
 class EmailPlugin(HuntOutputPlugin):
@@ -77,19 +133,15 @@ class EmailPlugin(HuntOutputPlugin):
   TODO
   """
 
+  name = "email"
   description = "Send an email for each result."
-
-  output_typeinfo = type_info.TypeDescriptorSet(
-      type_info.String(
-          description=("The address the results should be sent to."),
-          name="email"),
-      )
+  args_type = EmailPluginArgs
 
   template = """
-<html><body><h1>GRR Hunt %(hunt_id)s produced a new result.</h1>
+<html><body><h1>GRR Hunt's results collection %(collection_urn)s got a new result.</h1>
 
 <p>
-  Grr Hunt %(hunt_id)s just reported a response from client %(client_id)s
+  Grr Hunt's results collection %(collection_urn)s just got a response from client %(client_id)s
   (%(hostname)s): <br />
   <br />
   %(response)s
@@ -103,42 +155,39 @@ class EmailPlugin(HuntOutputPlugin):
 <p>The GRR team.</p>
 </body></html>"""
 
-  # A hardcoded limit on the number of results to send by mail.
-  email_limit = 100
-
   too_many_mails_msg = ("<p> This hunt has now produced %d results so the "
-                        "sending of emails will be disabled now. </p>"
-                        % email_limit)
+                        "sending of emails will be disabled now. </p>")
 
-  def __init__(self, hunt_obj, *args, **kw):
-    super(EmailPlugin, self).__init__(hunt_obj, *args, **kw)
-    self.hunt_id = hunt_obj.session_id
-    self.emails_sent = 0
+  def Initialize(self):
+    self.state.Register("emails_sent", 0)
+    super(EmailPlugin, self).Initialize()
 
-  def ProcessResponse(self, response, client_id):
+  def ProcessResponse(self, response):
     """Sends an email for each response."""
 
-    if self.emails_sent >= self.email_limit:
+    if self.state.emails_sent >= self.state.args.email_limit:
       return
 
+    client_id = response.source
     client = aff4.FACTORY.Open(client_id, token=self.token)
     hostname = client.Get(client.Schema.HOSTNAME) or "unknown hostname"
 
-    subject = "GRR Hunt %s produced a new result." % self.hunt_id
+    subject = ("GRR Hunt results collection %s got a new result." %
+               self.state.collection_urn)
 
     url = urllib.urlencode((("c", client_id),
                             ("main", "HostInformation")))
 
-    response_htm = rendering.renderers.FindRendererForObject(response).RawHTML()
+    response_htm = rendering.FindRendererForObject(response).RawHTML()
 
-    self.emails_sent += 1
-    if self.emails_sent == self.email_limit:
-      additional_message = self.too_many_mails_msg
+    self.state.emails_sent += 1
+    if self.state.emails_sent == self.state.args.email_limit:
+      additional_message = self.too_many_mails_msg % self.state.args.email_limit
     else:
       additional_message = ""
 
     email_alerts.SendEmail(
-        self.args["email"], "grr-noreply",
+        self.state.args.email, "grr-noreply",
         subject,
         self.template % dict(
             client_id=client_id,
@@ -146,8 +195,38 @@ class EmailPlugin(HuntOutputPlugin):
             hostname=hostname,
             urn=url,
             creator=self.token.username,
-            hunt_id=self.hunt_id,
+            collection_urn=self.state.collection_urn,
             response=response_htm,
             additional_message=additional_message,
             ),
         is_html=True)
+
+  @utils.Synchronized
+  def ProcessResponses(self, responses):
+    for response in responses:
+      self.ProcessResponse(response)
+
+
+class OutputPlugin(rdfvalue.RDFProtoStruct):
+  """A proto describing the output plugin to create."""
+  protobuf = flows_pb2.OutputPlugin
+
+  def GetPluginArgsClass(self):
+    plugin_cls = HuntOutputPlugin.classes.get(self.plugin_name)
+    if plugin_cls is not None:
+      return plugin_cls.args_type
+
+  def GetPluginForHunt(self, hunt_obj):
+    cls = HuntOutputPlugin.classes.get(self.plugin_name)
+    if cls is None:
+      raise KeyError("Unknown output plugin %s" % self.plugin_name)
+
+    return cls(hunt_obj.state.context.results_collection_urn,
+               args=self.plugin_args, token=hunt_obj.token)
+
+  def GetPluginForState(self, plugin_state):
+    cls = HuntOutputPlugin.classes.get(self.plugin_name)
+    if cls is None:
+      raise KeyError("Unknown output plugin %s" % self.plugin_name)
+
+    return cls(None, state=plugin_state)

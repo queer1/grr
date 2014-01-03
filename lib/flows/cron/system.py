@@ -5,49 +5,17 @@
 import bisect
 import time
 
+import logging
+
 from grr.lib import aff4
 from grr.lib import data_store
 from grr.lib import export_utils
 from grr.lib import flow
+from grr.lib import hunts
 from grr.lib import rdfvalue
-
 from grr.lib import utils
-from grr.proto import analysis_pb2
-
-
-class SystemCronFlow(flow.GRRFlow):
-  frequency = rdfvalue.Duration("1d")
-  lifetime = rdfvalue.Duration("20h")
-
-  __abstract = True  # pylint: disable=g-bad-name
-
-
-class Sample(rdfvalue.RDFProtoStruct):
-  """A Graph sample is a single data point."""
-  protobuf = analysis_pb2.Sample
-
-
-class Graph(rdfvalue.RDFProtoStruct):
-  """A Graph is a collection of sample points."""
-  protobuf = analysis_pb2.Graph
-
-  def Append(self, **kwargs):
-    self.data.Append(**kwargs)
-
-  def __len__(self):
-    return len(self.data)
-
-  def __getitem__(self, item):
-    return Sample(self.data[item])
-
-  def __iter__(self):
-    for x in self.data:
-      yield Sample(x)
-
-
-class GraphSeries(rdfvalue.RDFValueArray):
-  """A sequence of graphs (e.g. evolving over time)."""
-  rdf_type = Graph
+from grr.lib.aff4_objects import cronjobs
+from grr.lib.rdfvalues import stats
 
 
 class _ActiveCounter(object):
@@ -86,7 +54,7 @@ class _ActiveCounter(object):
     category = utils.SmartUnicode(category)
 
     for active_time in self.active_days:
-      if now - age < active_time * 24 * 60 * 60 * 1e6:
+      if (now - age).seconds < active_time * 24 * 60 * 60:
         self.categories[active_time][category] = self.categories[
             active_time].get(category, 0) + 1
 
@@ -94,7 +62,7 @@ class _ActiveCounter(object):
     """Generate a histogram object and store in the specified attribute."""
     histogram = self.attribute()
     for active_time in self.active_days:
-      graph = Graph(title="%s day actives" % active_time)
+      graph = stats.Graph(title="%s day actives" % active_time)
       for k, v in sorted(self.categories[active_time].items()):
         graph.Append(label=k, y_value=v)
 
@@ -111,32 +79,33 @@ class ClientFleetStats(aff4.AFF4Object):
   class SchemaCls(aff4.AFF4Object.SchemaCls):
     """Schema for ClientFleetStats object."""
 
-    GRRVERSION_HISTOGRAM = aff4.Attribute("aff4:stats/grrversion", GraphSeries,
+    GRRVERSION_HISTOGRAM = aff4.Attribute("aff4:stats/grrversion",
+                                          stats.GraphSeries,
                                           "GRR version statistics for active "
                                           "clients.")
 
     OS_HISTOGRAM = aff4.Attribute(
-        "aff4:stats/os_type", GraphSeries,
+        "aff4:stats/os_type", stats.GraphSeries,
         "Operating System statistics for active clients.")
 
-    RELEASE_HISTOGRAM = aff4.Attribute("aff4:stats/release", GraphSeries,
+    RELEASE_HISTOGRAM = aff4.Attribute("aff4:stats/release", stats.GraphSeries,
                                        "Release statistics for active clients.")
 
-    VERSION_HISTOGRAM = aff4.Attribute("aff4:stats/version", GraphSeries,
+    VERSION_HISTOGRAM = aff4.Attribute("aff4:stats/version", stats.GraphSeries,
                                        "Version statistics for active clients.")
 
     LAST_CONTACTED_HISTOGRAM = aff4.Attribute("aff4:stats/last_contacted",
-                                              Graph, "Last contacted time")
+                                              stats.Graph,
+                                              "Last contacted time")
 
 
-class AbstractClientStatsCronFlow(SystemCronFlow):
+class AbstractClientStatsCronFlow(cronjobs.SystemCronFlow):
   """A cron job which opens every client in the system.
 
   We feed all the client objects to the AbstractClientStatsCollector instances.
   """
 
   CLIENT_STATS_URN = rdfvalue.RDFURN("aff4:/stats/ClientFleetStats")
-  OPEN_CHUNK_LIMIT = 10000
 
   def BeginProcessing(self):
     pass
@@ -147,33 +116,36 @@ class AbstractClientStatsCronFlow(SystemCronFlow):
   def FinishProcessing(self):
     pass
 
-  @flow.StateHandler(next_state="ProcessAllClients")
-  def Start(self):
-    """Calls "Process" state to avoid spending too much time in Start method."""
-    self.CallState(next_state="ProcessAllClients")
-
   @flow.StateHandler()
-  def ProcessAllClients(self, unused_responses):
+  def Start(self):
     """Retrieve all the clients for the AbstractClientStatsCollectors."""
-    self.stats = aff4.FACTORY.Create(self.CLIENT_STATS_URN, "ClientFleetStats",
-                                     mode="w", token=self.token)
-    self.BeginProcessing()
     try:
+      self.stats = aff4.FACTORY.Create(self.CLIENT_STATS_URN,
+                                       "ClientFleetStats",
+                                       mode="w", token=self.token)
+      self.BeginProcessing()
+
       root = aff4.FACTORY.Open(aff4.ROOT_URN, token=self.token)
       children_urns = list(root.ListChildren())
+      logging.info("Found %d children.", len(children_urns))
 
-      while children_urns:
-        to_read = children_urns[:self.OPEN_CHUNK_LIMIT]
-        children_urns = children_urns[self.OPEN_CHUNK_LIMIT:]
-        for child in aff4.FACTORY.MultiOpen(to_read, mode="r", token=self.token,
-                                            age=aff4.NEWEST_TIME):
+      processed_count = 0
+      for child in aff4.FACTORY.MultiOpen(
+          children_urns, mode="r", token=self.token, age=aff4.NEWEST_TIME):
+        if isinstance(child, aff4.AFF4Object.VFSGRRClient):
           self.ProcessClient(child)
+          processed_count += 1
 
         # This flow is not dead: we don't want to run out of lease time.
-        self.Ping()
-    finally:
+        self.HeartBeat()
+
       self.FinishProcessing()
       self.stats.Close()
+
+      logging.info("Processed %d clients.", processed_count)
+    except Exception as e:  # pylint: disable=broad-except
+      logging.exception("Error while calculating stats: %s", e)
+      raise
 
 
 class GRRVersionBreakDown(AbstractClientStatsCronFlow):
@@ -258,12 +230,43 @@ class LastAccessStats(AbstractClientStatsCronFlow):
     ping = client.Get(client.Schema.PING)
     if ping:
       time_ago = now - ping
-      pos = bisect.bisect(self._bins, time_ago)
+      pos = bisect.bisect(self._bins, time_ago.microseconds)
 
       # If clients are older than the last bin forget them.
       try:
         self._value[pos] += 1
       except IndexError:
         pass
+
+
+class InterrogateClientsCronFlow(cronjobs.SystemCronFlow):
+  """A cron job which runs an interrogate hunt on all clients.
+
+  Interrogate needs to be run regularly on our clients to keep host information
+  fresh and enable searching by username etc. in the GUI.
+  """
+  frequency = rdfvalue.Duration("1w")
+  lifetime = rdfvalue.Duration("1w")
+
+  def GetOutputPlugins(self):
+    """Returns list of rdfvalue.OutputPlugin objects to be used in the hunt."""
+    return []
+
+  @flow.StateHandler()
+  def Start(self):
+    with hunts.GRRHunt.StartHunt(
+        hunt_name="GenericHunt",
+        flow_runner_args=rdfvalue.FlowRunnerArgs(flow_name="Interrogate"),
+        flow_args=rdfvalue.InterrogateArgs(lightweight=False),
+        regex_rules=[],
+        output_plugins=self.GetOutputPlugins(),
+        token=self.token) as hunt:
+
+      with hunt.GetRunner() as runner:
+        runner.args.client_rate = 0
+        runner.args.expiry_time = "1w"
+        runner.args.description = ("Interrogate run by cron to keep host"
+                                   "info fresh.")
+        runner.Start()
 
 

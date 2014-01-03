@@ -1,13 +1,14 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """This file contains various utility classes used by GRR."""
 
 
-
+import __builtin__
 import base64
 import os
+import Queue
 import random
 import re
+import shlex
 import socket
 import shutil
 import struct
@@ -82,17 +83,15 @@ def Synchronized(f):
 class InterruptableThread(threading.Thread):
   """A class which exits once the main thread exits."""
 
-  # Class wide constant
-  exit = False
-  threads = []
-
   def __init__(self, target=None, args=None, kwargs=None, sleep_time=10, **kw):
+    self.exit = False
+    self.last_run = 0
     self.target = target
     self.args = args or ()
     self.kwargs = kwargs or {}
     self.sleep_time = sleep_time
-
     super(InterruptableThread, self).__init__(**kw)
+
     # Do not hold up program exit
     self.daemon = True
 
@@ -100,31 +99,24 @@ class InterruptableThread(threading.Thread):
     """This will be repeatedly called between sleeps."""
 
   def run(self):
+    # When the main thread exits, the time module might disappear and be already
+    # None. We take a local reference to the functions we need.
+    sleep = time.sleep
+    now = time.time
+
     while not self.exit:
       if self.target:
         self.target(*self.args, **self.kwargs)
       else:
         self.Iterate()
 
-      # During shutdown range can disappear leaving ugly error messages.
-      if not range:
-        self.exit = True
-        continue
+      # Implement interruptible sleep here.
+      self.last_run = now()
 
-      for _ in range(self.sleep_time):
-        if self.exit:
-          break
-        try:
-          if time:
-            time.sleep(1)
-          else:
-            self.exit = True
-            break
-        except (AttributeError, TypeError):
-          # When the main thread exits, time might be already None. We should
-          # just ignore that and exit as well.
-          self.exit = True
-          break
+      # Exit if the main thread disappears.
+      while (time and not self.exit and
+             now() < self.last_run + self.sleep_time):
+        sleep(1)
 
 
 class Node(object):
@@ -535,7 +527,7 @@ def GroupBy(items, key):
     key_id = key(item)
     key_map.setdefault(key_id, []).append(item)
 
-  return key_map.iteritems()
+  return key_map
 
 
 def SmartStr(string):
@@ -680,6 +672,37 @@ def JoinPath(*parts):
   return NormalizePath(u"/".join(parts))
 
 
+def GuessWindowsFileNameFromString(str_in):
+  """Take a commandline string and guess the file path.
+
+  Commandline strings can be space separated and contain options.
+  e.g. C:\\Program Files\\ACME Corporation\\wiz.exe /quiet /blah
+
+  See here for microsoft doco on commandline parsing:
+  http://msdn.microsoft.com/en-us/library/windows/desktop/ms682425(v=vs.85).aspx
+
+  Args:
+    str_in: commandline string
+  Returns:
+    list of candidate filename strings.
+  """
+  guesses = []
+  current_str = ""
+
+  # If paths are quoted as recommended, just use that path.
+  if str_in.startswith(("\"", "'")):
+    guesses = [shlex.split(str_in)[0]]
+  else:
+    for component in str_in.split(" "):
+      if current_str:
+        current_str = " ".join((current_str, component))
+      else:
+        current_str = component
+      guesses.append(current_str)
+
+  return guesses
+
+
 def Join(*parts):
   """Join (AFF4) paths without normalizing.
 
@@ -736,26 +759,21 @@ def GeneratePassphrase(length=20):
 class PRNG(object):
   """An optimized PRNG."""
 
-  random_list_ushort = None
-  random_list_ulong = None
+  random_list = []
 
   @classmethod
   def GetUShort(cls):
-    if not cls.random_list_ushort:
-      PRNG.random_list_ushort = list(
-          struct.unpack("=" + "H" * 1000,
-                        os.urandom(struct.calcsize("=H") * 1000)))
-
-    return cls.random_list_ushort.pop()
+    return cls.GetULong() & 0xFFFF
 
   @classmethod
   def GetULong(cls):
-    if not cls.random_list_ulong:
-      PRNG.random_list_ulong = list(
-          struct.unpack("=" + "L" * 1000,
-                        os.urandom(struct.calcsize("=L") * 1000)))
-
-    return cls.random_list_ulong.pop()
+    while True:
+      try:
+        return cls.random_list.pop()
+      except IndexError:
+        PRNG.random_list = list(
+            struct.unpack("=" + "L" * 1000,
+                          os.urandom(struct.calcsize("=L") * 1000)))
 
 
 def FormatNumberAsString(num):
@@ -769,3 +787,58 @@ def FormatNumberAsString(num):
 
 class NotAValue(object):
   pass
+
+
+def issubclass(obj, cls):    # pylint: disable=redefined-builtin,g-bad-name
+  """A sane implementation of issubclass.
+
+  See http://bugs.python.org/issue10569
+
+  Python bare issubclass must be protected by an isinstance test first since it
+  can only work on types and raises when provided something which is not a type.
+
+  Args:
+    obj: Any object or class.
+    cls: The class to check against.
+
+  Returns:
+    True if obj is a subclass of cls and False otherwise.
+  """
+  return isinstance(obj, type) and __builtin__.issubclass(obj, cls)
+
+
+def ConditionalImport(name):
+  try:
+    return __import__(name)
+  except ImportError:
+    pass
+
+
+class HeartbeatQueue(Queue.Queue):
+  """A queue that periodically calls a provided callback while waiting."""
+
+  def __init__(self, callback=None, fast_poll_time=60, *args, **kw):
+    Queue.Queue.__init__(self, *args, **kw)
+    self.callback = callback or (lambda: None)
+    self.last_item_time = time.time()
+    self.fast_poll_time = fast_poll_time
+
+  def get(self, poll_interval=5):
+    while True:
+      try:
+        # Using Queue.get() with a timeout is really expensive - Python uses
+        # busy waiting that wakes up the process every 50ms - so we switch
+        # to a more efficient polling method if there is no activity for
+        # <fast_poll_time> seconds.
+        if time.time() - self.last_item_time < self.fast_poll_time:
+          message = Queue.Queue.get(self, block=True, timeout=poll_interval)
+        else:
+          time.sleep(poll_interval)
+          message = Queue.Queue.get(self, block=False)
+        break
+
+      except Queue.Empty:
+        self.callback()
+
+    self.last_item_time = time.time()
+    return message

@@ -11,6 +11,7 @@ import logging
 
 from grr.gui import renderers
 from grr.gui.plugins import fileview
+from grr.gui.plugins import semantic
 
 from grr.lib import access_control
 from grr.lib import aff4
@@ -87,8 +88,8 @@ class ConfigManager(renderers.TemplateRenderer):
           if parameter in self.redacted_options or is_bad_section:
             option_value = raw_value = "<REDACTED>"
           else:
-            option_value = config_lib.CONFIG.Get(parameter)
-            raw_value = config_lib.CONFIG.GetRaw(parameter)
+            option_value = config_lib.CONFIG.Get(parameter, default=None)
+            raw_value = config_lib.CONFIG.GetRaw(parameter, default=None)
 
           info.append((parameter, raw_value, option_value))
 
@@ -161,20 +162,22 @@ class ConfigFileTable(fileview.AbstractFileTable):
   root_path = "/config"
   toolbar = "ConfigFileTableToolbar"
 
+  context_help_url = "user_manual.html#_downloading_agents"
+
   def __init__(self, **kwargs):
     super(ConfigFileTable, self).__init__(**kwargs)
 
-    self.AddColumn(renderers.RDFValueColumn(
-        "Icon", renderer=renderers.IconRenderer, width="40px"))
-    self.AddColumn(renderers.RDFValueColumn(
-        "Name", renderer=renderers.SubjectRenderer, sortable=True, width="25%"))
-    self.AddColumn(renderers.AttributeColumn("type", width="25%"))
+    self.AddColumn(semantic.RDFValueColumn(
+        "Icon", renderer=semantic.IconRenderer, width="40px"))
+    self.AddColumn(semantic.RDFValueColumn(
+        "Name", renderer=semantic.SubjectRenderer, sortable=True, width="25%"))
+    self.AddColumn(semantic.AttributeColumn("type", width="25%"))
     self.AddColumn(ConfigDescriptionColumn(width="25%"))
-    self.AddColumn(renderers.RDFValueColumn(
+    self.AddColumn(semantic.RDFValueColumn(
         "Age", renderer=fileview.AgeSelector, width="25%"))
 
 
-class ConfigDescriptionColumn(renderers.AttributeColumn):
+class ConfigDescriptionColumn(renderers.TableColumn):
   """An AttributeColumn for Details which is different depending on type."""
 
   def __init__(self, **kwargs):
@@ -182,7 +185,7 @@ class ConfigDescriptionColumn(renderers.AttributeColumn):
     # for the details column.
     self.attrs = [aff4.Attribute.GetAttributeByName("installation"),
                   aff4.Attribute.GetAttributeByName("size")]
-    renderers.RDFValueColumn.__init__(self, name="Details", **kwargs)
+    super(ConfigDescriptionColumn, self).__init__(name="Details", **kwargs)
 
   def AddRowFromFd(self, index, fd):
     """Add a new value from the fd customizing for the type."""
@@ -309,5 +312,5 @@ class ConfigurationViewInitHook(registry.InitHook):
 
   def Run(self):
     """Create the necessary directories."""
-    token = access_control.ACLToken("system", "Init")
+    token = access_control.ACLToken(username="system", reason="Init")
     maintenance_utils.CreateBinaryConfigPaths(token=token)

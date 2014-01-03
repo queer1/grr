@@ -4,7 +4,9 @@
 
 import os
 
+from grr.client import vfs
 from grr.lib import aff4
+from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib import utils
@@ -132,8 +134,9 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
     self.assertRaises(IOError, client.OpenMember, pb.first.path)
 
     # Check that the hash is recorded correctly.
+    sha256 = fd.Get(fd.Schema.HASH).sha256
     self.assertEqual(
-        str(fd.Get(fd.Schema.HASH)),
+        sha256,
         "67d4ff71d43921d5739f387da09746f405e425b07d727e4c69d029461d1f051f")
 
   def testGlob(self):
@@ -141,37 +144,89 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
 
     # Add some usernames we can interpolate later.
     client = aff4.FACTORY.Open(self.client_id, mode="rw", token=self.token)
-    client.Set(client.Schema.USERNAMES("test syslog"))
+    users = client.Schema.USER()
+    users.Append(username="test")
+    users.Append(username="syslog")
+    client.Set(users)
     client.Close()
 
-    client_mock = test_lib.ActionMock("ListDirectory", "StatFile")
+    client_mock = test_lib.ActionMock("Find", "StatFile")
 
     # This glob selects all files which start with the username on this system.
-    path = os.path.join(self.base_path, "%%Usernames%%*")
+    paths = [os.path.join(self.base_path, "%%Users.username%%*"),
+             os.path.join(self.base_path, "wtmp")]
 
     # Run the flow.
     for _ in test_lib.TestFlowHelper(
         "Glob", client_mock, client_id=self.client_id,
-        paths=[path], pathtype=rdfvalue.PathSpec.PathType.OS,
+        paths=paths, pathtype=rdfvalue.PathSpec.PathType.OS,
         token=self.token):
       pass
 
     output_path = self.client_id.Add("fs/os").Add(
         self.base_path.replace("\\", "/"))
 
-    count = 0
+    children = []
     fd = aff4.FACTORY.Open(output_path, token=self.token)
     for child in fd.ListChildren():
-      childname = child.Basename()
-      self.assertTrue(childname.startswith("test") or
-                      childname.startswith("syslog"))
-      count += 1
+      children.append(child.Basename())
 
     # We should find some files.
-    self.assertTrue(count >= 6)
+    self.assertEqual(sorted(children),
+                     sorted(["syslog", "syslog_compress.gz",
+                             "syslog_false.gz", "test_artifact.json",
+                             "test_img.dd", "test.plist", "tests", "tests_long",
+                             "wtmp"]))
+
+  def testGlobWithStarStar(self):
+    """Test that ** expressions mean recursion."""
+
+    # Add some usernames we can interpolate later.
+    client = aff4.FACTORY.Open(self.client_id, mode="rw", token=self.token)
+    users = client.Schema.USER()
+    users.Append(username="test")
+    users.Append(username="syslog")
+    client.Set(users)
+    client.Close()
+
+    client_mock = test_lib.ActionMock("Find", "StatFile")
+
+    # Glob for foo at a depth of 4.
+    paths = [
+        os.path.join(self.base_path, "test_img.dd/", "foo**4")]
+
+    # Run the flow.
+    for _ in test_lib.TestFlowHelper(
+        "Glob", client_mock, client_id=self.client_id,
+        paths=paths, pathtype=rdfvalue.PathSpec.PathType.OS,
+        token=self.token):
+      pass
+
+    output_path = self.client_id.Add("fs/tsk").Add(
+        self.base_path.replace("\\", "/")).Add("test_img.dd/glob_test/a/b")
+
+    children = []
+    fd = aff4.FACTORY.Open(output_path, token=self.token)
+    for child in fd.ListChildren():
+      children.append(child.Basename())
+
+    # We should find some files.
+    self.assertEqual(children, ["foo"])
+
+  def testGlobWithInvalidStarStar(self):
+    client_mock = test_lib.ActionMock("Find", "StatFile")
+
+    # This glob is invalid since it uses 2 ** expressions..
+    paths = [os.path.join(self.base_path, "test_img.dd", "**", "**", "foo")]
+
+    # Make sure the flow raises.
+    self.assertRaises(ValueError, list, test_lib.TestFlowHelper(
+        "Glob", client_mock, client_id=self.client_id,
+        paths=paths, pathtype=rdfvalue.PathSpec.PathType.OS,
+        token=self.token))
 
   def testGlobWithWildcardsInsideTSKFile(self):
-    client_mock = test_lib.ActionMock("ListDirectory", "StatFile")
+    client_mock = test_lib.ActionMock("Find", "StatFile")
 
     # This glob should find this file in test data: glob_test/a/b/foo.
     path = os.path.join(self.base_path, "test_img.dd", "*", "a", "b", "*")
@@ -193,10 +248,11 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
     self.assertEqual(children[0].Basename(), "foo")
 
   def testGlobWithWildcardInTSKFilename(self):
-    client_mock = test_lib.ActionMock("ListDirectory", "StatFile")
+    client_mock = test_lib.ActionMock("Find", "StatFile")
 
-    # This glob should find this file in test data: glob_test/a/b/foo.
-    path = os.path.join(self.base_path, "test_img.*", "*", "a", "b", "*")
+    # This glob should find this file in test data: glob_test/a/b/foo. Match the
+    # file with the wrong case to test case insensitive globbing.
+    path = os.path.join(self.base_path, "test_IMG.*", "*", "a", "b", "*")
 
     # Run the flow.
     for _ in test_lib.TestFlowHelper(
@@ -239,7 +295,7 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
 
     client.Close()
 
-    client_mock = test_lib.ActionMock("ListDirectory", "StatFile")
+    client_mock = test_lib.ActionMock("Find", "StatFile")
 
     # This glob selects all files which start with the username on this system.
     path = os.path.join(os.path.dirname(self.base_path),
@@ -264,7 +320,7 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
 
     pattern = "test_data/{ntfs_img.dd,*.log,*.raw}"
 
-    client_mock = test_lib.ActionMock("ListDirectory", "StatFile")
+    client_mock = test_lib.ActionMock("Find", "StatFile")
     path = os.path.join(os.path.dirname(self.base_path), pattern)
 
     # Run the flow.
@@ -276,29 +332,47 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
   def testIllegalGlob(self):
     """Test that illegal globs raise."""
 
-    pattern = "Test/%%Weird_illegal_attribute%%"
-
-    client_mock = test_lib.ActionMock("ListDirectory", "StatFile")
-    path = os.path.join(os.path.dirname(self.base_path), pattern)
+    paths = ["Test/%%Weird_illegal_attribute%%"]
 
     # Run the flow - we expect an AttributeError error to be raised from the
     # flow since Weird_illegal_attribute is not a valid client attribute.
-    self.assertRaises(AttributeError, list, test_lib.TestFlowHelper(
-        "Glob", client_mock, client_id=self.client_id,
-        paths=[path], token=self.token))
+    self.assertRaises(AttributeError, flow.GRRFlow.StartFlow,
+                      flow_name="Glob", paths=paths,
+                      client_id=self.client_id, token=self.token)
 
-  def testGlobAndDownload(self):
+  def testIllegalGlobAsync(self):
+    # When running the flow asynchronously, we will not receive any errors from
+    # the Start method, but the flow should still fail.
+    paths = ["Test/%%Weird_illegal_attribute%%"]
+    client_mock = test_lib.ActionMock("Find", "StatFile")
+
+    # Run the flow.
+    session_id = None
+
+    # This should not raise here since the flow is run asynchronously.
+    for session_id in test_lib.TestFlowHelper(
+        "Glob", client_mock, client_id=self.client_id, check_flow_errors=False,
+        paths=paths, pathtype=rdfvalue.PathSpec.PathType.OS, token=self.token,
+        sync=False):
+      pass
+
+    fd = aff4.FACTORY.Open(session_id, token=self.token)
+    self.assertTrue("AttributeError" in fd.state.context.backtrace)
+    self.assertEqual("ERROR", str(fd.state.context.state))
+
+  def testFetchFilesFlow(self):
 
     pattern = "test_data/*.log"
 
-    client_mock = test_lib.ActionMock("ListDirectory", "TransferBuffer",
-                                      "StatFile")
+    client_mock = test_lib.ActionMock("Find", "TransferBuffer",
+                                      "StatFile", "HashBuffer", "HashFile")
     path = os.path.join(os.path.dirname(self.base_path), pattern)
 
     # Run the flow.
     for _ in test_lib.TestFlowHelper(
-        "GlobAndDownload", client_mock, client_id=self.client_id,
-        paths=[path], token=self.token):
+        "FetchFiles", client_mock, client_id=self.client_id,
+        paths=[path], pathtype=rdfvalue.PathSpec.PathType.OS,
+        token=self.token):
       pass
 
     for f in "auth.log dpkg.log dpkg_false.log".split():
@@ -308,67 +382,88 @@ class TestFilesystem(test_lib.FlowTestsBaseclass):
       # Make sure that some data was downloaded.
       self.assertTrue(fd.Get(fd.Schema.SIZE) > 100)
 
-  def BrokenTestGlobAndGrep(self):
-    """Disabled test.
+  def testDownloadDirectory(self):
+    """Test a FetchFiles flow with depth=1."""
+    vfs.VFS_HANDLERS[
+        rdfvalue.PathSpec.PathType.OS] = test_lib.ClientVFSHandlerFixture
 
-    TODO(user): this test doesn't work because globandrunflow runs
-    multiple greps that all trash each others output collections.
-    """
-    pattern = "test_data/*.log"
+    # Mock the client actions FetchFiles uses
+    client_mock = test_lib.ActionMock("HashFile", "HashBuffer", "StatFile",
+                                      "Find", "TransferBuffer")
 
-    client_mock = test_lib.ActionMock("ListDirectory", "Grep", "StatFile")
-    path = os.path.join(os.path.dirname(self.base_path), pattern)
+    pathspec = rdfvalue.PathSpec(
+        path="/c/Downloads", pathtype=rdfvalue.PathSpec.PathType.OS)
 
-    args = {"request": rdfvalue.GrepSpec(
-        target=rdfvalue.PathSpec(),
-        literal="session opened for user dearjohn",
-        mode=rdfvalue.GrepSpec.Mode.ALL_HITS
-        ),
-            "output": "analysis/grep/testing"}
-
-    # Run the flow.
     for _ in test_lib.TestFlowHelper(
-        "GlobAndGrep", client_mock, client_id=self.client_id,
-        paths=[path], token=self.token, **args):
+        "FetchFiles", client_mock, client_id=self.client_id,
+        findspec=rdfvalue.FindSpec(max_depth=1, pathspec=pathspec,
+                                   path_glob="*"),
+        token=self.token):
       pass
 
-    fd = aff4.FACTORY.Open(
-        rdfvalue.RDFURN(self.client_id).Add("/analysis/grep/testing"),
-        token=self.token)
-    # Make sure that there is a hit.
-    # TODO(user): multiple runs of this test sometimes return 0 results.
-    self.assertEqual(len(fd), 1)
-    first = fd[0]
-    self.assertEqual(first.offset, 350)
-    self.assertEqual(first.data,
-                     "session): session opened for user dearjohn by (uid=0")
+    # Check if the base path was created
+    output_path = self.client_id.Add("fs/os/c/Downloads")
 
-  def testGlobAndListDirectory(self):
+    output_fd = aff4.FACTORY.Open(output_path, token=self.token)
 
-    fd = aff4.FACTORY.Open(rdfvalue.RDFURN(self.client_id).Add("/fs/os").Add(
-        os.path.join(os.path.dirname(self.base_path), "test_data")),
-                           token=self.token)
-    self.assertEqual(len(list(fd.ListChildren())), 0)
+    children = list(output_fd.OpenChildren())
 
-    pattern = "test_*"
+    # There should be 5 children: a.txt, b.txt, c.txt, d.txt sub1
+    self.assertEqual(len(children), 5)
 
-    client_mock = test_lib.ActionMock("ListDirectory", "TransferBuffer",
-                                      "StatFile")
-    path = os.path.join(os.path.dirname(self.base_path), pattern)
+    self.assertEqual("a.txt b.txt c.txt d.txt sub1".split(),
+                     sorted([child.urn.Basename() for child in children]))
 
-    # Run the flow.
+    # Find the child named: a.txt
+    for child in children:
+      if child.urn.Basename() == "a.txt":
+        break
+
+    # Check the AFF4 type of the child, it should have changed
+    # from VFSFile to VFSBlobImage
+    self.assertEqual(child.__class__.__name__, "VFSBlobImage")
+
+  def testDownloadDirectorySub(self):
+    """Test a FetchFiles flow with depth=5."""
+    vfs.VFS_HANDLERS[
+        rdfvalue.PathSpec.PathType.OS] = test_lib.ClientVFSHandlerFixture
+
+    # Mock the client actions FetchFiles uses
+    client_mock = test_lib.ActionMock("HashFile", "HashBuffer", "StatFile",
+                                      "Find", "TransferBuffer")
+
+    pathspec = rdfvalue.PathSpec(
+        path="/c/Downloads", pathtype=rdfvalue.PathSpec.PathType.OS)
+
     for _ in test_lib.TestFlowHelper(
-        "GlobAndListDirectory", client_mock, client_id=self.client_id,
-        paths=[path], token=self.token):
+        "FetchFiles", client_mock, client_id=self.client_id,
+        findspec=rdfvalue.FindSpec(max_depth=5, pathspec=pathspec,
+                                   path_glob="*"),
+        token=self.token):
       pass
 
-    fd = aff4.FACTORY.Open(rdfvalue.RDFURN(self.client_id).Add("/fs/os").Add(
-        os.path.join(os.path.dirname(self.base_path), "test_data")),
-                           token=self.token)
+    # Check if the base path was created
+    output_path = self.client_id.Add("fs/os/c/Downloads")
 
-    children = list(fd.ListChildren())
-    self.assertGreater(len(children), 30)
-    filenames = [os.path.basename(str(f)) for f in children]
+    output_fd = aff4.FACTORY.Open(output_path, token=self.token)
 
-    for f in "auth.log dpkg.log dpkg_false.log".split():
-      self.assertIn(f, filenames)
+    children = list(output_fd.OpenChildren())
+
+    # There should be 5 children: a.txt, b.txt, c.txt, d.txt, sub1
+    self.assertEqual(len(children), 5)
+
+    self.assertEqual("a.txt b.txt c.txt d.txt sub1".split(),
+                     sorted([child.urn.Basename() for child in children]))
+
+    # Find the child named: sub1
+    for child in children:
+      if child.urn.Basename() == "sub1":
+        break
+
+    children = list(child.OpenChildren())
+
+    # There should be 4 children: a.txt, b.txt, c.txt, d.txt
+    self.assertEqual(len(children), 4)
+
+    self.assertEqual("a.txt b.txt c.txt d.txt".split(),
+                     sorted([child.urn.Basename() for child in children]))

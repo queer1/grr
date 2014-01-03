@@ -36,6 +36,7 @@ able to filter it directly).
 
 
 import abc
+import atexit
 import sys
 import time
 
@@ -47,9 +48,6 @@ from grr.lib import flags
 from grr.lib import registry
 from grr.lib import stats
 from grr.lib import utils
-
-config_lib.DEFINE_string("Datastore.implementation", "FakeDataStore",
-                         "Storage subsystem to use.")
 
 flags.DEFINE_bool("list_storage", False,
                   "List all storage subsystems present.")
@@ -78,7 +76,7 @@ class TransactionError(Error):
 
 
 # This token will be used by default if no token was provided.
-default_token = access_control.ACLToken()
+default_token = None
 
 
 class DataStore(object):
@@ -86,19 +84,21 @@ class DataStore(object):
 
   __metaclass__ = registry.MetaclassRegistry
 
-  # This contains the supported filters by the datastore implementations.
-  filter = None
-
   # Constants relating to timestamps.
   ALL_TIMESTAMPS = "ALL_TIMESTAMPS"
   NEWEST_TIMESTAMP = "NEWEST_TIMESTAMP"
   TIMESTAMPS = [ALL_TIMESTAMPS, NEWEST_TIMESTAMP]
 
   def __init__(self):
-    security_manager = access_control.BaseAccessControlManager.NewPlugin(
+    security_manager = access_control.BaseAccessControlManager.GetPlugin(
         config_lib.CONFIG["Datastore.security_manager"])()
     self.security_manager = security_manager
     logging.info("Using security manager %s", security_manager)
+
+    # Start the flusher thread.
+    self.flusher_thread = utils.InterruptableThread(target=self.Flush,
+                                                    sleep_time=0.5)
+    self.flusher_thread.start()
 
   def Initialize(self):
     """Initialization of the datastore."""
@@ -164,37 +164,38 @@ class DataStore(object):
           logging.debug("Transaction took %s tries.", timeout)
         return result
       except TransactionError:
+        stats.STATS.IncrementCounter("datastore_retries")
         time.sleep(retrywrap_timeout)
         timeout += retrywrap_timeout
 
     raise TransactionError("Retry number exceeded.")
 
-  def Decode(self, value, decoder=None):
-    if decoder:
-      try:
-        result = decoder()
-        result.ParseFromString(value)
-      except AttributeError:
-        result = decoder(value)
-
-      return result
-
   @abc.abstractmethod
-  def Transaction(self, subject, token=None):
+  def Transaction(self, subject, lease_time=None, token=None):
     """Returns a Transaction object for a subject.
 
-    This opens a read lock to the subject. Any read access to the
-    subject will have a consistent view between threads. Any attempts
-    to write to the subject must be followed by a commit. Transactions
-    may fail and raise the TransactionError() exception. A transaction
-    may fail due to failure of the underlying system or another thread
-    holding a transaction on this object at the same time.
+    This opens a read/write lock to the subject. Any read access to the subject
+    will have a consistent view between threads. Any attempts to write to the
+    subject must be followed by a commit. Transactions may fail and raise the
+    TransactionError() exception. A transaction may fail due to failure of the
+    underlying system or another thread holding a transaction on this object at
+    the same time.
 
-    Users should retry the transaction if it fails to commit.
+    Note that concurrent writes in and out of the transaction are allowed. If
+    you want to guarantee that the object is not modified during the
+    transaction, it must always be accessed with a transaction. Non
+    transactioned writes will be visible to transactions. This makes it possible
+    to update predicates both under transaction and without a transaction, if
+    these predicates are independent.
+
+    Users should almost always call RetryWrapper() to rety the transaction if it
+    fails to commit.
 
     Args:
         subject: The subject which the transaction applies to. Only a
-           single subject may be locked in a transaction.
+          single subject may be locked in a transaction.
+        lease_time: The minimum amount of time the transaction should remain
+          alive.
         token: An ACL token.
 
     Returns:
@@ -233,7 +234,18 @@ class DataStore(object):
       token: An ACL token.
     """
 
-  def Resolve(self, subject, predicate, decoder=None, token=None):
+  @abc.abstractmethod
+  def DeleteAttributesRegex(self, subject, regexes, token=None):
+    """Remove all predicates according to a regex.
+
+    Args:
+      subject: The subject that will have these attributes removed.
+      regexes: A list of regular expressions to match the attributes to be
+        removed.
+      token: An ACL token.
+    """
+
+  def Resolve(self, subject, predicate, token=None):
     """Retrieve a value set for a subject's predicate.
 
     This method is easy to use but always gets the latest version of the
@@ -243,8 +255,6 @@ class DataStore(object):
     Args:
       subject: The subject URN.
       predicate: The predicate URN.
-      decoder: If specified the cell value will be parsed by constructing this
-             class.
       token: An ACL token.
 
     Returns:
@@ -256,7 +266,7 @@ class DataStore(object):
       AccessError: if anything goes wrong.
     """
     for _, value, timestamp in self.ResolveMulti(
-        subject, [utils.EscapeRegex(predicate)], decoder=decoder,
+        subject, [utils.EscapeRegex(predicate)],
         token=token, timestamp=self.NEWEST_TIMESTAMP):
 
       # Just return the first one.
@@ -266,16 +276,13 @@ class DataStore(object):
 
   @abc.abstractmethod
   def MultiResolveRegex(self, subjects, predicate_regex, token=None,
-                        decoder=None, timestamp=None, limit=None):
+                        timestamp=None, limit=None):
     """Generate a set of values matching for subjects' predicate.
 
     Args:
       subjects: A list of subjects.
       predicate_regex: The predicate URN regex.
       token: An ACL token.
-
-      decoder: If specified the cell value will be parsed by
-          constructing this class.
 
       timestamp: A range of times for consideration (In
           microseconds). Can be a constant such as ALL_TIMESTAMPS or
@@ -293,16 +300,13 @@ class DataStore(object):
     """
 
   def ResolveRegex(self, subject, predicate_regex, token=None,
-                   decoder=None, timestamp=None, limit=1000):
+                   timestamp=None, limit=1000):
     """Retrieve a set of value matching for this subject's predicate.
 
     Args:
       subject: The subject that we will search.
       predicate_regex: The predicate URN regex.
       token: An ACL token.
-
-      decoder: If specified the cell value will be parsed by
-          constructing this class.
 
       timestamp: A range of times for consideration (In
           microseconds). Can be a constant such as ALL_TIMESTAMPS or
@@ -316,53 +320,16 @@ class DataStore(object):
     Raises:
       AccessError: if anything goes wrong.
     """
-    result = self.MultiResolveRegex(
-        [subject], predicate_regex, decoder=decoder,
-        timestamp=timestamp, token=token, limit=limit).get(subject, [])
-    result.sort(key=lambda a: a[0])
-    return result
+    for _, values in self.MultiResolveRegex(
+        [subject], predicate_regex, timestamp=timestamp, token=token,
+        limit=limit):
+      values.sort(key=lambda a: a[0])
+      return values
+
+    return []
 
   def ResolveRow(self, subject, **kw):
     return self.ResolveRegex(subject, ".*", **kw)
-
-  @abc.abstractmethod
-  def Query(self, attributes=None, filter_obj="", subject_prefix="", token=None,
-            subjects=None, limit=100, timestamp=None):
-    """Selects a set of subjects based on filters.
-
-    Examples:
-      Retrieves all subjects which have the attribute foobar set.
-
-          Query(HasPredicateFilter("foobar"))
-
-      Retrieve subjects which contain "foo" in attribute "bar":
-          Query(PredicateContainsFilter("foo","bar"))
-
-      Retrieve subjects which have both the foo and bar attributes set:
-          Query(AndFilter(HasPredicateFilter("foo"),HasPredicateFilter("bar")))
-
-    Args:
-     attributes: A list of attributes to return (None returns all attributes).
-     filter_obj: A Filter() instance.
-     subject_prefix: A prefix restriction for subjects.
-     token: An ACL token.
-     subjects: A list of subject names which the query applies to.
-     limit: A (start, length) tuple of integers representing subjects to
-            return. Useful for paging. If its a single integer we take
-            it as the length limit (start=0).
-     timestamp: A range of times for consideration (In
-                microseconds). Can be a constant such as ALL_TIMESTAMPS or
-                NEWEST_TIMESTAMP or a tuple of ints (start, end).
-
-    Yields:
-      A dict for each subject that matches. The Keys are named by the attributes
-      requested, the values are a list of tuples of (value, timestamp). The
-      special key "subject" represents the subject name which is always
-      returned.
-
-    Raises:
-      AttributeError: When attributes is not a sequence of stings.
-    """
 
   def Flush(self):
     """Flushes the DataStore."""
@@ -388,7 +355,7 @@ class Transaction(object):
   __metaclass__ = registry.MetaclassRegistry
 
   @abc.abstractmethod
-  def __init__(self, table, subject, token=None):
+  def __init__(self, table, subject, lease_time=None, token=None):
     """Constructor.
 
     This is never called directly but produced from the
@@ -397,6 +364,7 @@ class Transaction(object):
     Args:
       table: A data_store handler.
       subject: The name of a subject to lock.
+      lease_time: The minimum length of time the transaction will remain valid.
       token: An ACL token which applies to all methods in this transaction.
     """
 
@@ -409,13 +377,11 @@ class Transaction(object):
     """
 
   @abc.abstractmethod
-  def Resolve(self, predicate, decoder=None):
+  def Resolve(self, predicate):
     """Retrieve a value set for this subject's predicate.
 
     Args:
       predicate: The predicate URN.
-      decoder: If specified the cell value will be parsed by constructing this
-               class.
 
     Returns:
        A (string, timestamp), or (None, 0) or a (decoded protobuf, timestamp) if
@@ -426,13 +392,11 @@ class Transaction(object):
     """
 
   @abc.abstractmethod
-  def ResolveRegex(self, predicate_regex, decoder=None, timestamp=None):
+  def ResolveRegex(self, predicate_regex, timestamp=None):
     """Retrieve a set of values matching for this subject's predicate.
 
     Args:
       predicate_regex: The predicate URN regex.
-      decoder: If specified the cell value will be parsed by constructing this
-               class.
 
       timestamp: A range of times for consideration (In
           microseconds). Can be a constant such as ALL_TIMESTAMPS or
@@ -445,6 +409,21 @@ class Transaction(object):
     Raises:
       AccessError: if anything goes wrong.
     """
+
+  def UpdateLease(self, duration):
+    """Update the transaction lease by at least the number of seconds.
+
+    Note that not all data stores implement timed transactions. This method is
+    only useful for data stores which expire a transaction after some time.
+
+    Args:
+      duration: The number of seconds to extend the transaction lease.
+    """
+    raise NotImplementedError
+
+  def CheckLease(self):
+    """Checks if this transaction is still valid."""
+    return True
 
   @abc.abstractmethod
   def Set(self, predicate, value, timestamp=None, replace=True):
@@ -488,6 +467,9 @@ class ResultSet(object):
   def __iter__(self):
     return iter(self.results)
 
+  def __getitem__(self, item):
+    return self.results[item]
+
   def __len__(self):
     return len(self.results)
 
@@ -518,14 +500,16 @@ class DataStoreInit(registry.InitHook):
       sys.exit(0)
 
     try:
-      cls = DataStore.NewPlugin(config_lib.CONFIG["Datastore.implementation"])
+      cls = DataStore.GetPlugin(config_lib.CONFIG["Datastore.implementation"])
     except KeyError:
       raise RuntimeError("No Storage System %s found." %
                          config_lib.CONFIG["Datastore.implementation"])
 
     DB = cls()  # pylint: disable=g-bad-name
     DB.Initialize()
+    atexit.register(DB.Flush)
 
   def RunOnce(self):
     """Initialize some Varz."""
     stats.STATS.RegisterCounterMetric("grr_commit_failure")
+    stats.STATS.RegisterCounterMetric("datastore_retries")

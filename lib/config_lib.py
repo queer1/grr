@@ -9,6 +9,7 @@ http://grr.googlecode.com/git/docs/configuration.html
 
 import collections
 import ConfigParser
+import errno
 import os
 import re
 import StringIO
@@ -27,11 +28,12 @@ from grr.lib import type_info
 from grr.lib import utils
 
 
-flags.DEFINE_string("config", "/etc/grr/grr-server.yaml",
+flags.DEFINE_string("config", None,
                     "Primary Configuration file to use.")
 
 flags.DEFINE_list("secondary_configs", [],
-                  "Secondary configuration files to load.")
+                  "Secondary configuration files to load (These override "
+                  "previous configuration files.).")
 
 flags.DEFINE_bool("config_help", False,
                   "Print help about the configuration.")
@@ -42,17 +44,27 @@ flags.DEFINE_list("context", [],
 flags.DEFINE_list("plugins", [],
                   "Load these files as additional plugins.")
 
+flags.PARSER.add_argument(
+    "-p", "--parameter", action="append",
+    default=[],
+    help="Global override of config values. "
+    "For example -p DataStore.implementation=MySQLDataStore")
+
 
 class Error(Exception):
   """Base class for configuration exceptions."""
 
 
-class ConfigFormatError(Error):
+class ConfigFormatError(Error, type_info.TypeValueError):
   """Raised when configuration file is formatted badly."""
 
 
 class ConfigWriteError(Error):
   """Raised when we failed to update the config."""
+
+
+class UnknownOption(Error, KeyError):
+  """Raised when an unknown option was requested."""
 
 
 class FilterError(Error):
@@ -97,6 +109,13 @@ class Filename(ConfigFilter):
       return open(data, "rb").read(1024000)
     except IOError as e:
       raise FilterError("%s: %s" % (data, e))
+
+
+class UnixPath(ConfigFilter):
+  name = "unixpath"
+
+  def Filter(self, data):
+    return data.replace("\\", "/")
 
 
 class Base64(ConfigFilter):
@@ -311,7 +330,16 @@ class YamlParser(GRRConfigParser):
     elif filename:
       try:
         self.parsed = yaml.safe_load(open(filename, "rb")) or OrderedYamlDict()
-      except (OSError, IOError):
+
+      except IOError as e:
+        if e.errno == errno.EACCES:
+          # Specifically catch access denied errors, this usually indicates the
+          # user wanted to read the file, and it existed, but they lacked the
+          # permissions.
+          raise IOError(e)
+        else:
+          self.parsed = OrderedYamlDict()
+      except OSError:
         self.parsed = OrderedYamlDict()
 
       self.filename = filename
@@ -534,6 +562,7 @@ class GrrConfigManager(object):
     self.validated = set()
     self.writeback = None
     self.writeback_data = OrderedYamlDict()
+    self.global_override = dict()
     self.context_descriptions = {}
 
     # This is the type info set describing all configuration
@@ -665,8 +694,7 @@ class GrrConfigManager(object):
     if self.writeback is None:
       logging.warn("Attempting to modify a read only config object.")
 
-    writeback_data = self.writeback_data
-    writeback_data[name] = value
+    self.writeback_data[name] = value
     self.FlushCache()
 
   def Set(self, name, value):
@@ -690,11 +718,13 @@ class GrrConfigManager(object):
     writeback_data = self.writeback_data
 
     # Check if the new value conforms with the type_info.
-    type_info_obj = self.FindTypeInfo(name)
-    value = type_info_obj.ToString(value)
+    if value is not None:
+      type_info_obj = self.FindTypeInfo(name)
+      value = type_info_obj.ToString(value)
+      if isinstance(value, basestring):
+        value = self.EscapeString(value)
 
-    writeback_data[name] = self.EscapeString(value)
-
+    writeback_data[name] = value
     self.FlushCache()
 
   def EscapeString(self, string):
@@ -728,6 +758,9 @@ class GrrConfigManager(object):
          name, otherwise we raise.
     """
     descriptor.section = descriptor.name.split(".")[0]
+    if descriptor.name in self.type_infos:
+      logging.warning("Config Option %s multiply defined!", descriptor.name)
+
     self.type_infos.Append(descriptor)
 
     # Register this option's default value.
@@ -748,6 +781,13 @@ class GrrConfigManager(object):
   def PrintHelp(self):
     print self.FormatHelp()
 
+  default_descriptors = {
+      str: type_info.String,
+      unicode: type_info.String,
+      int: type_info.Integer,
+      list: type_info.List,
+      }
+
   def MergeData(self, merge_data, raw_data=None):
     self.FlushCache()
     if raw_data is None:
@@ -763,14 +803,15 @@ class GrrConfigManager(object):
         # Find the descriptor for this field.
         descriptor = self.type_infos.get(k)
         if descriptor is None:
-          logging.debug(
-              "Parameter %s in config file not known, assuming string", k)
-          descriptor = type_info.String(name=k, default="")
+          descriptor_cls = self.default_descriptors.get(type(v),
+                                                        type_info.String)
+          descriptor = descriptor_cls(name=k)
+          logging.debug("Parameter %s in config file not known, assuming %s",
+                        k, type(descriptor))
           self.AddOption(descriptor)
 
-        # None is a valid value: it means the value is not set.
-        if v is not None:
-          v = utils.SmartStr(v).strip()
+        if isinstance(v, basestring):
+          v = v.strip()
 
         raw_data[k] = v
 
@@ -817,7 +858,7 @@ class GrrConfigManager(object):
     return parser
 
   def Initialize(self, filename=None, data=None, fd=None, reset=True,
-                 validate=True, must_exist=False, parser=ConfigFileParser):
+                 must_exist=False, parser=ConfigFileParser):
     """Initializes the config manager.
 
     This method is used to add more config options to the manager. The config
@@ -832,9 +873,6 @@ class GrrConfigManager(object):
 
       reset: If true, the previous configuration will be erased.
 
-      validate: If true, new values are checked for their type. Can be disabled
-        to speed up testing.
-
       must_exist: If true the data source must exist and be a valid
         configuration file, or we raise an exception.
 
@@ -848,7 +886,6 @@ class GrrConfigManager(object):
         not exist..
     """
     self.FlushCache()
-    self.validate = validate
     if reset:
       # Clear previous configuration.
       self.raw_data = OrderedYamlDict()
@@ -874,11 +911,10 @@ class GrrConfigManager(object):
 
   def __getitem__(self, name):
     """Retrieve a configuration value after suitable interpolations."""
-    result = self.Get(name)
-    if result is None:
-      raise KeyError("Config parameter %s not known." % name)
+    if name not in self.type_infos:
+      raise UnknownOption("Config parameter %s not known." % name)
 
-    return result
+    return self.Get(name)
 
   def GetRaw(self, name, context=None, default=utils.NotAValue):
     """Get the raw value without interpolations."""
@@ -889,7 +925,7 @@ class GrrConfigManager(object):
     _, value = self._GetValue(name, context, default=default)
     return value
 
-  def Get(self, name, context=None, default=utils.NotAValue):
+  def Get(self, name, default=utils.NotAValue, context=None):
     """Get the value contained  by the named parameter.
 
     This method applies interpolation/escaping of the named parameter and
@@ -899,11 +935,11 @@ class GrrConfigManager(object):
       name: The name of the parameter to retrieve. This should be in the format
         of "Section.name"
 
+      default: If retrieving the value results in an error, return this default.
+
       context: A context to resolve the configuration. This is a set of roles
         the caller is current executing with. For example (client, windows). If
         not specified we take the context from the current thread's TLS stack.
-
-      default: If retrieving the value results in an error, return this default.
 
     Returns:
       The value of the parameter.
@@ -914,20 +950,29 @@ class GrrConfigManager(object):
     # Use a default global context if context is not provided.
     if context is None:
       # Only use the cache when no special context is specified.
-      if name in self.cache:
+      if default is utils.NotAValue and name in self.cache:
         return self.cache[name]
 
       calc_context = self.context
 
     type_info_obj = self.FindTypeInfo(name)
-    _, value = self._GetValue(name, context=calc_context, default=default)
+    _, return_value = self._GetValue(
+        name, context=calc_context, default=default)
+
+    # If we returned the specified default, we just return it here.
+    if return_value is default:
+      return default
 
     try:
       return_value = self.InterpolateValue(
-          value, default_section=name.split(".")[0],
+          return_value, default_section=name.split(".")[0],
           type_info_obj=type_info_obj, context=calc_context)
+    except (lexer.ParseError, ValueError) as e:
+      # We failed to parse the value, but a default was specified, so we just
+      # return that.
+      if default is not utils.NotAValue:
+        return default
 
-    except (lexer.ParseError, type_info.TypeValueError) as e:
       raise ConfigFormatError("While parsing %s: %s" % (name, e))
 
     try:
@@ -942,7 +987,7 @@ class GrrConfigManager(object):
       raise
 
     # Only use the cache when no special context is specified.
-    if context is None:
+    if context is None and default is utils.NotAValue:
       self.cache[name] = return_value
 
     return return_value
@@ -957,13 +1002,9 @@ class GrrConfigManager(object):
         context_raw_data = raw_data[element]
 
         value = context_raw_data.get(name)
-        # Some configuration parsers can represent values in native
-        # types, but since we already have the type info system to
-        # parse and serialize all values to strings, we do not need
-        # it. We therefore always store values in configuration files
-        # as strings.
         if value is not None:
-          value = str(value).strip()
+          if isinstance(value, basestring):
+            value = value.strip()
 
           yield context_raw_data, value, path + [element]
 
@@ -976,11 +1017,16 @@ class GrrConfigManager(object):
     """Search for the value based on the context."""
     container = self.defaults
 
-    # First we try to find the defaults.
-    if default is utils.NotAValue:
-      value = self.defaults[name]
-    else:
+    # The caller provided a default value.
+    if default is not utils.NotAValue:
       value = default
+
+    # Take the default from the definition.
+    elif name in self.defaults:
+      value = self.defaults[name]
+
+    else:
+      raise UnknownOption("Option %s not defined." % name)
 
     # We resolve the required key with the default raw data, and then iterate
     # over all elements in the context to see if there are overriding context
@@ -1001,7 +1047,14 @@ class GrrConfigManager(object):
       value = matches[-1][1]
       container = matches[-1][0]
 
-      if len(matches) >= 2 and len(matches[-1][2]) == len(matches[-2][2]):
+      if (len(matches) >= 2 and len(matches[-1][2]) == len(matches[-2][2]) and
+          matches[-1][2] != matches[-2][2]):
+        # This warning specifies that there is an ambiguous match, the config
+        # attempts to find the most specific value e.g. if you have a value
+        # for X.y in context A,B,C, and a value for X.y in D,B it should choose
+        # the one in A,B,C. This warning is for if you have a value in context
+        # A,B and one in A,C. The config doesn't know which one to pick so picks
+        # one and displays this warning.
         logging.warn("Ambiguous configuration for key %s: "
                      "Contexts of equal length: %s and %s", name,
                      matches[-1][2], matches[-2][2])
@@ -1013,6 +1066,10 @@ class GrrConfigManager(object):
       if new_value is not None:
         value = new_value
         container = self.writeback_data
+
+    # Allow the global override to force an option value.
+    if name in self.global_override:
+      return self.global_override, self.global_override[name]
 
     return container, value
 
@@ -1131,6 +1188,11 @@ def DEFINE_list(name, default, help):
                                   validator=type_info.String()))
 
 
+def DEFINE_semantic(semantic_type, name, default=None, description=""):
+  CONFIG.AddOption(type_info.RDFValueType(
+      rdfclass=semantic_type, name=name, default=default, help=description))
+
+
 def DEFINE_option(type_descriptor):
   CONFIG.AddOption(type_descriptor)
 
@@ -1178,24 +1240,33 @@ def LoadConfig(config_obj, config_file, secondary_configs=None,
   return config_obj
 
 
-def ConfigLibInit():
-  """Initializer for the config, reads in the config file.
+def ParseConfigCommandLine():
+  """Parse all the command line options which control the config system."""
+  # The user may specify the primary config file on the command line.
+  if flags.FLAGS.config:
+    CONFIG.Initialize(filename=flags.FLAGS.config, must_exist=True)
 
-  This will be called by startup.Init() unless it is overridden by
-  lib/local/config.py
+  # Allow secondary configuration files to be specified.
+  if flags.FLAGS.secondary_configs:
+    for config_url in flags.FLAGS.secondary_configs:
+      CONFIG.LoadSecondaryConfig(config_url)
 
-  Raises:
-    RuntimeError: No configuration file specified.
-  """
-  if flags.FLAGS.config is None:
-    raise RuntimeError("No configuration file specified.")
+  # Allow individual options to be specified as global overrides.
+  for statement in flags.FLAGS.parameter:
+    if "=" not in statement:
+      raise RuntimeError(
+          "statement %s on command line not valid." % statement)
 
-  LoadConfig(
-      CONFIG, config_file=flags.FLAGS.config,
-      secondary_configs=flags.FLAGS.secondary_configs,
-      contexts=flags.FLAGS.context)
+    name, value = statement.split("=", 1)
+    CONFIG.global_override[name] = value
 
-  # Does the user want to dump help?
+  # Load additional contexts from the command line.
+  for context in flags.FLAGS.context:
+    CONFIG.AddContext(context)
+
+  # Does the user want to dump help? We do this after the config system is
+  # initialized so the user can examine what we think the value of all the
+  # parameters are.
   if flags.FLAGS.config_help:
     print "Configuration overview."
 
@@ -1223,7 +1294,7 @@ class PluginLoader(registry.InitHook):
     directory, filename = os.path.split(path)
     module_name, ext = os.path.splitext(filename)
 
-    # Its a python file.
+    # It's a python file.
     if ext in cls.PYTHON_EXTENSIONS:
       # Make sure python can find the file.
       sys.path.insert(0, directory)
@@ -1261,7 +1332,3 @@ class PluginLoader(registry.InitHook):
 
     else:
       logging.error("Plugin %s has incorrect extension.", path)
-
-
-DEFINE_string("Config.writeback", "",
-              "Location for writing back the configuration.")

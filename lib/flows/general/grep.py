@@ -1,129 +1,85 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
-
 """A simple grep flow."""
 
 
-
-import time
+import stat
 
 from grr.lib import aff4
 from grr.lib import flow
 from grr.lib import rdfvalue
-from grr.lib import type_info
-from grr.lib import utils
+from grr.proto import flows_pb2
 
 
-class Grep(flow.GRRFlow):
-  """Greps a file on the client for a pattern or a regex.
+class SearchFileContentArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.SearchFileContentArgs
 
-  This flow operates on files only, see GlobAndGrep if you want to grep a
-  directory.
 
-  Returns to parent flow:
-      RDFValueArray of BufferReference objects.
+class SearchFileContent(flow.GRRFlow):
+  """A flow that runs a glob first and then issues a grep on the results.
+
+  This flow can be used to search for files by filename. Simply specify a glob
+  expression for the filename:
+
+  %%KnowledgeBase.environ_windir%%/notepad.exe
+
+  By also specifying a grep specification, the file contents can also be
+  searched.
   """
-
   category = "/Filesystem/"
+  friendly_name = "Search In Files"
+  args_type = rdfvalue.SearchFileContentArgs
+  behaviours = flow.GRRFlow.behaviours + "BASIC"
 
-  XOR_IN_KEY = 37
-  XOR_OUT_KEY = 57
+  @classmethod
+  def GetDefaultArgs(cls, token=None):
+    _ = token
+    return cls.args_type(paths=[r"%%Users.homedir%%/.bash_history"])
 
-  flow_typeinfo = type_info.TypeDescriptorSet(
-      type_info.GrepspecType(
-          description="The file which will be grepped.",
-          name="request"),
-
-      type_info.String(
-          description="The output collection.",
-          name="output",
-          default="analysis/grep/{u}-{t}"),
-      )
-
-  @flow.StateHandler(next_state=["StoreResults"])
+  @flow.StateHandler(next_state=["Grep"])
   def Start(self):
-    """Start Grep flow."""
-    self.state.request.xor_in_key = self.XOR_IN_KEY
-    self.state.request.xor_out_key = self.XOR_OUT_KEY
+    """Run the glob first."""
+    if self.runner.output:
+      self.runner.output = aff4.FACTORY.Create(
+          self.runner.output.urn, "GrepResultsCollection", mode="rw",
+          token=self.token)
 
-    # For literal matches we xor the search term. In the event we search the
-    # memory this stops us matching the GRR client itself.
-    if self.state.request.literal:
-      self.state.request.literal = utils.Xor(self.state.request.literal,
-                                             self.XOR_IN_KEY)
+      self.runner.output.Set(self.runner.output.Schema.DESCRIPTION(
+          "SearchFiles {0}".format(self.__class__.__name__)))
 
-    self.state.Register("output_collection", None)
-    self.CallClient("Grep", self.state.request, next_state="StoreResults")
+    self.CallFlow("Glob", next_state="Grep",
+                  paths=self.args.paths, pathtype=self.args.pathtype)
 
-  @flow.StateHandler()
-  def StoreResults(self, responses):
+  @flow.StateHandler(next_state=["WriteHits", "End"])
+  def Grep(self, responses):
     if responses.success:
-      output = self.state.output.format(t=time.time(),
-                                        u=self.state.context.user)
-      out_urn = self.client_id.Add(output)
+      # Grep not specified - just list all hits.
+      if not self.args.grep:
+        msgs = [rdfvalue.BufferReference(pathspec=r.pathspec)
+                for r in responses]
+        self.CallStateInline(messages=msgs, next_state="WriteHits")
+      else:
+        # Grep specification given, ask the client to grep the files.
+        for response in responses:
+          # Only fetch regular files here.
+          if not stat.S_ISDIR(response.st_mode):
 
-      fd = aff4.FACTORY.Create(out_urn, "GrepResultsCollection",
-                               mode="w", token=self.token)
+            # Cast the BareGrepSpec to a GrepSpec type.
+            request = rdfvalue.GrepSpec(target=response.pathspec,
+                                        **self.args.grep.AsDict())
+            self.CallClient("Grep", request=request, next_state="WriteHits",
+                            request_data=dict(pathspec=response.pathspec))
 
-      self.state.output_collection = fd
+  @flow.StateHandler(next_state="End")
+  def WriteHits(self, responses):
+    """Sends replies about the hits."""
+    hits = list(responses)
 
-      if self.state.request.HasField("literal"):
-        self.state.request.literal = utils.Xor(self.state.request.literal,
-                                               self.XOR_IN_KEY)
-      fd.Set(fd.Schema.DESCRIPTION("Grep by %s: %s" % (
-          self.state.context.user, str(self.state.request))))
+    for hit in hits:
+      # Old clients do not send pathspecs in the Grep response so we add them.
+      if not hit.pathspec:
+        hit.pathspec = responses.request_data.GetItem("pathspec")
+      self.SendReply(hit)
 
-      for response in responses:
-        response.data = utils.Xor(response.data,
-                                  self.XOR_OUT_KEY)
-        response.length = len(response.data)
-        fd.Add(response)
-        self.SendReply(response)
-
-    else:
-      self.Notify("FlowStatus", self.session_id,
-                  "Error grepping file: %s." % responses.status)
-
-  @flow.StateHandler()
-  def End(self):
-    if self.state.output_collection is not None:
-      self.state.output_collection.Flush()
-      self.Notify("ViewObject", self.state.output_collection.urn,
-                  u"Grep completed. %d hits" %
-                  len(self.state.output_collection))
-
-
-class GrepAndDownload(flow.GRRFlow):
-  """Downloads file if a signature is found.
-
-  This flow greps a file on the client for a literal or regex and, if the
-  pattern is found, downloads the file.
-  """
-
-  category = "/Filesystem/"
-
-  flow_typeinfo = (Grep.flow_typeinfo)
-
-  @flow.StateHandler(next_state=["DownloadFile"])
-  def Start(self):
-    self.state.request.mode = rdfvalue.GrepSpec.Mode.FIRST_HIT
-    self.CallFlow("Grep", request=self.state.request, next_state="DownloadFile")
-
-  @flow.StateHandler(next_state=["StoreDownload", "End"])
-  def DownloadFile(self, responses):
-    if responses:
-      self.Log("Grep completed with %s hits, downloading file.", len(responses))
-      self.CallFlow("FastGetFile", pathspec=responses.First().pathspec,
-                    next_state="StoreDownload")
-    else:
-      self.Log("Grep did not yield any results.")
-
-  @flow.StateHandler()
-  def StoreDownload(self, responses):
-    if not responses.success:
-      raise flow.FlowError("Error while downloading file: %s" %
-                           responses.status.error_message)
-    else:
-      stat = responses.First()
-      self.Notify("ViewObject", stat.aff4path,
-                  "File downloaded successfully")
+    if self.args.also_download:
+      self.CallFlow("MultiGetFile", pathspecs=[x.pathspec for x in hits],
+                    next_state="End")

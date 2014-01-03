@@ -13,10 +13,10 @@ progress of existing flows.
 
 from grr.gui import renderers
 from grr.gui.plugins import fileview
+from grr.gui.plugins import semantic
 from grr.lib import data_store
-from grr.lib import flow_runner
+from grr.lib import queue_manager
 from grr.lib import rdfvalue
-from grr.lib import scheduler
 
 
 class InspectView(renderers.Splitter2Way):
@@ -55,24 +55,23 @@ class RequestTable(renderers.TableRenderer):
 
   def __init__(self, **kwargs):
     super(RequestTable, self).__init__(**kwargs)
-    self.AddColumn(renderers.RDFValueColumn(
-        "Status", renderer=renderers.IconRenderer, width="40px"))
+    self.AddColumn(semantic.RDFValueColumn(
+        "Status", renderer=semantic.IconRenderer, width="40px"))
 
-    self.AddColumn(renderers.RDFValueColumn(
+    self.AddColumn(semantic.RDFValueColumn(
         "ID", renderer=renderers.ValueRenderer))
-    self.AddColumn(renderers.RDFValueColumn("Due"))
-    self.AddColumn(renderers.RDFValueColumn("Flow", width="70%"))
-    self.AddColumn(renderers.RDFValueColumn("Client Action", width="30%"))
+    self.AddColumn(semantic.RDFValueColumn("Due"))
+    self.AddColumn(semantic.RDFValueColumn("Flow", width="70%"))
+    self.AddColumn(semantic.RDFValueColumn("Client Action", width="30%"))
 
   def BuildTable(self, start_row, end_row, request):
     client_id = rdfvalue.ClientURN(request.REQ.get("client_id"))
     now = rdfvalue.RDFDatetime().Now()
 
-    # Make a local scheduler.
-    scheduler_obj = scheduler.TaskScheduler()
+    # Make a local QueueManager.
+    manager = queue_manager.QueueManager(token=request.token)
 
-    for i, task in enumerate(scheduler_obj.Query(client_id, limit=end_row,
-                                                 token=request.token)):
+    for i, task in enumerate(manager.Query(client_id, limit=end_row)):
       if i < start_row:
         continue
 
@@ -103,8 +102,8 @@ class ResponsesTable(renderers.TableRenderer):
 
   def __init__(self, **kwargs):
     super(ResponsesTable, self).__init__(**kwargs)
-    self.AddColumn(renderers.RDFValueColumn("Task ID"))
-    self.AddColumn(renderers.RDFValueColumn(
+    self.AddColumn(semantic.RDFValueColumn("Task ID"))
+    self.AddColumn(semantic.RDFValueColumn(
         "Response", renderer=fileview.GrrMessageRenderer, width="100%"))
 
   def BuildTable(self, start_row, end_row, request):
@@ -113,26 +112,28 @@ class ResponsesTable(renderers.TableRenderer):
 
     task_id = "task:%s" % request.REQ.get("task_id", "")
 
-    # This is the request.
-    scheduler_obj = scheduler.TaskScheduler()
+    # Make a local QueueManager.
+    manager = queue_manager.QueueManager(token=request.token)
 
-    request_messages = scheduler_obj.Query(
-        client_id, task_id=task_id, token=request.token)
+    # This is the request.
+    request_messages = manager.Query(client_id, task_id=task_id)
 
     if not request_messages: return
 
     request_message = request_messages[0]
 
-    state_queue = (flow_runner.FlowManager.FLOW_STATE_TEMPLATE %
-                   request_message.session_id)
+    state_queue = request_message.session_id.Add(
+        "state/request:%08X" % request_message.request_id)
 
-    predicate_re = (flow_runner.FlowManager.FLOW_RESPONSE_PREFIX %
+    predicate_re = (manager.FLOW_RESPONSE_PREFIX %
                     request_message.request_id) + ".*"
 
     # Get all the responses for this request.
-    for i, (predicate, message, _) in enumerate(data_store.DB.ResolveRegex(
-        state_queue, predicate_re, decoder=rdfvalue.GrrMessage, limit=end_row,
-        token=request.token)):
+    for i, (predicate, serialized_message, _) in enumerate(
+        data_store.DB.ResolveRegex(state_queue, predicate_re,
+                                   limit=end_row, token=request.token)):
+
+      message = rdfvalue.GrrMessage(serialized_message)
 
       if i < start_row:
         continue
@@ -211,12 +212,12 @@ class RequestRenderer(renderers.TemplateRenderer):
     client_id = rdfvalue.ClientURN(request.REQ.get("client_id"))
     task_id = "task:" + request.REQ.get("task_id")
 
-    # Make a local scheduler.
-    scheduler_obj = scheduler.TaskScheduler()
-    msgs = scheduler_obj.Query(client_id, task_id=task_id, token=request.token)
+    # Make a local QueueManager.
+    manager = queue_manager.QueueManager(token=request.token)
+    msgs = manager.Query(client_id, task_id=task_id)
     if msgs:
       self.msg = msgs[0]
-      self.view = renderers.FindRendererForObject(
+      self.view = semantic.FindRendererForObject(
           self.msg).RawHTML(request)
 
     return super(RequestRenderer, self).Layout(request, response)

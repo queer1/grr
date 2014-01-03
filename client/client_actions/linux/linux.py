@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
-
 """Linux specific actions."""
 
 
@@ -220,6 +218,9 @@ class EnumerateUsers(actions.ActionPlugin):
             break
 
           wtmp = wtmp[record.size:]
+          # Users only appear for USER_PROCESS events, others are system.
+          if record.ut_type != 7:
+            continue
 
           try:
             if users[record.ut_user] < record.tv_sec:
@@ -245,8 +246,16 @@ class EnumerateUsers(actions.ActionPlugin):
           homedir = ""
           full_name = ""
 
-        self.SendReply(username=username, homedir=homedir,
-                       full_name=full_name, last_logon=last_login*1000000)
+        # Somehow the last login time can be < 0. There is no documentation
+        # what this means so we just set it to 0 (the rdfvalue field is
+        # unsigned so we can't send negative values).
+        if last_login < 0:
+          last_login = 0
+
+        self.SendReply(username=utils.SmartUnicode(username),
+                       homedir=utils.SmartUnicode(homedir),
+                       full_name=utils.SmartUnicode(full_name),
+                       last_logon=last_login*1000000)
 
 
 class EnumerateFilesystems(actions.ActionPlugin):
@@ -290,6 +299,18 @@ class EnumerateRunningServices(actions.ActionPlugin):
   """
   in_rdfvalue = None
   out_rdfvalue = None
+
+  def Run(self, unused_arg):
+    raise RuntimeError("Not implemented")
+
+
+class Uninstall(actions.ActionPlugin):
+  """Uninstall GRR. Place holder, does nothing.
+
+  Note this needs to handle the different distributions separately, e.g. Redhat
+  vs Debian.
+  """
+  out_rdfvalue = rdfvalue.DataBlob
 
   def Run(self, unused_arg):
     raise RuntimeError("Not implemented")
@@ -372,8 +393,8 @@ class InstallDriver(UninstallDriver):
     try:
       fd = tempfile.NamedTemporaryFile()
       data = args.driver.data
-      if args.mode >= rdfvalue.InstallDriverRequest.RewriteMode.ENABLE:
-        force = args.mode == rdfvalue.InstallDriverRequest.RewriteMode.FORCE
+      if args.mode >= rdfvalue.DriverInstallTemplate.RewriteMode.ENABLE:
+        force = args.mode == rdfvalue.DriverInstallTemplate.RewriteMode.FORCE
         data = ko_patcher.KernelObjectPatcher().Patch(data, force_patch=force)
       fd.write(data)
       fd.flush()

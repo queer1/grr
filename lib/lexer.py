@@ -70,7 +70,7 @@ class Lexer(object):
   flags = 0
 
   def __init__(self, data=""):
-    self.buffer = data
+    self.buffer = utils.SmartStr(data)
     self.state_stack = []
 
   def NextToken(self):
@@ -311,6 +311,7 @@ class SearchParser(Lexer):
   expression_cls = Expression
   binary_expression_cls = BinaryExpression
   identity_expression_cls = IdentityExpression
+  string = ""
 
   tokens = [
       # Double quoted string
@@ -407,7 +408,7 @@ class SearchParser(Lexer):
 
   def InsertArg(self, string="", **_):
     """Insert an arg to the current expression."""
-    logging.debug("Storing Argument %s", string)
+    logging.debug("Storing Argument %s", utils.SmartUnicode(string))
 
     # This expression is complete
     if self.current_expression.AddArg(string):

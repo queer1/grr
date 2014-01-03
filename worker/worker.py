@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """This is a backend analysis worker which will be deployed on the server.
 
 We basically pull a new task from the task master, and run the plugin
@@ -28,7 +27,7 @@ def main(unused_argv):
   startup.Init()
 
   # Start a worker
-  token = access_control.ACLToken("GRRWorker", "Implied.")
+  token = access_control.ACLToken(username="GRRWorker")
   worker_obj = worker.GRRWorker(queue=worker.DEFAULT_WORKER_QUEUE,
                                 token=token)
 
