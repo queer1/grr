@@ -89,18 +89,15 @@ class ArtifactListRenderer(forms.MultiSelectListRenderer):
     # Get all artifacts that aren't Bootstrap and aren't the base class.
     self.artifacts = {}
     artifact.LoadArtifactsFromDatastore(token=request.token)
-    for arifact_name, artifact_cls in artifact_lib.Artifact.classes.items():
-      if artifact_cls is not artifact_lib.Artifact.top_level_class:
-        if set(["Bootstrap"]).isdisjoint(artifact_cls.LABELS):
-          self.artifacts[arifact_name] = artifact_cls
+    for name, artifact_val in artifact_lib.ArtifactRegistry.artifacts.items():
+      if set(["Bootstrap"]).isdisjoint(artifact_val.labels):
+        self.artifacts[name] = artifact_val
     self.labels = artifact_lib.ARTIFACT_LABELS
 
     # Convert artifacts into a dict usable from javascript.
     artifact_dict = {}
-    for artifact_name, artifact_cls in self.artifacts.items():
-      if artifact_name == "Artifact":
-        continue
-      artifact_dict[artifact_name] = artifact_cls.ToExtendedDict()
+    for artifact_name, artifact_val in self.artifacts.items():
+      artifact_dict[artifact_name] = artifact_val.ToExtendedDict()
       processors = []
       for processor in parsers.Parser.GetClassesByArtifact(artifact_name):
         processors.append({"name": processor.__name__,
@@ -128,17 +125,13 @@ class ArtifactRDFValueRenderer(semantic.RDFValueRenderer):
 <div id={{unique|escape}}_artifact_description>"""
       + ArtifactListRenderer.artifact_template + """
 </div>
-<script>
-  var description_element = "{{unique|escapejs}}_artifact_description";
-  var artifact_obj = JSON.parse("{{this.artifact_str|escapejs}}");
-  grr.artifact_view.renderArtifactFromObject(artifact_obj, description_element);
-  $('div[name=artifact_name]').hide();   // Remove heading to clean up display.
-</script>
 """)
 
   def Layout(self, request, response):
     self.artifact_str = self.proxy.ToPrettyJson()
-    super(ArtifactRDFValueRenderer, self).Layout(request, response)
+    response = super(ArtifactRDFValueRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "ArtifactRDFValueRenderer.Layout",
+                               artifact_str=self.artifact_str)
 
 
 class ArtifactRawRDFValueRenderer(semantic.RDFValueRenderer):
@@ -210,7 +203,7 @@ class ArtifactManagerToolbar(renderers.TemplateRenderer):
 <ul id="toolbar_{{unique|escape}}" class="breadcrumb">
   <li>
     <button id='{{unique|escape}}_upload' class="btn"
-      title="Upload Artifacts as JSON"
+      title="Upload Artifacts as JSON or YAML"
       data-toggle="modal" data-target="#upload_dialog_{{unique|escape}}">
       <img src='/static/images/upload.png' class='toolbar_icon'>
     </button>
@@ -231,16 +224,11 @@ class ArtifactManagerToolbar(renderers.TemplateRenderer):
     data-dismiss="modal" aria-hidden="true">Close</button>
   </div>
 </div>
-
-<script>
-
-$("#upload_dialog_{{unique|escapejs}}").on("show", function () {
-  grr.layout("ArtifactJsonUploadView",
-    "upload_dialog_body_{{unique|escapejs}}");
-});
-
-</script>
 """)
+
+  def Layout(self, request, response):
+    response = super(ArtifactManagerToolbar, self).Layout(request, response)
+    return self.CallJavascript(response, "ArtifactManagerToolbar.Layout")
 
 
 class ArtifactJsonUploadView(fileview.UploadView):
@@ -260,7 +248,7 @@ class ArtifactUploadHandler(fileview.UploadHandler):
       content = StringIO.StringIO()
       for chunk in self.uploaded_file.chunks():
         content.write(chunk)
-      self.dest_path = artifact.UploadArtifactJsonFile(
+      self.dest_path = artifact.UploadArtifactYamlFile(
           content.getvalue(), token=request.token)
 
       return renderers.TemplateRenderer.Layout(self, request, response,

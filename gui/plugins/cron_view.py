@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- mode: python; encoding: utf-8 -*-
 #
-# Copyright 2012 Google Inc. All Rights Reserved.
 
 """This is the interface for managing cron jobs."""
 
@@ -178,7 +177,7 @@ class CronTable(renderers.TableRenderer):
         cron_jobs_urns[start_row:end_row], aff4_type="CronJob",
         token=request.token, age=aff4.ALL_TIMES)
 
-    for i, cron_job in enumerate(cron_jobs):
+    for i, cron_job in enumerate(sorted(cron_jobs)):
       if self.IsCronJobFailing(cron_job):
         self.SetRowClass(i + start_row, "error")
       elif self.IsCronJobStuck(cron_job):

@@ -170,18 +170,33 @@ class SubjectRenderer(RDFValueRenderer):
   classname = "Subject"
 
   layout_template = renderers.Template("""
-<span type=subject aff4_path='{{this.aff4_path|escape}}'>
+<span type=subject aff4_path='{{this.aff4_path|escape}}'
+  tree_node_id='{{this.tree_node_id|escape}}'>
   {{this.basename|escape}}
 </span>
 """)
 
   def Layout(self, request, response):
+    if not self.proxy:
+      return
+
     aff4_path = request.REQ.get("aff4_path", "")
     aff4_path = rdfvalue.RDFURN(aff4_path)
     self.basename = self.proxy.RelativeName(aff4_path) or self.proxy
     self.aff4_path = self.proxy
+    self.tree_node_id = renderers.DeriveIDFromPath(
+        "/".join(self.aff4_path.Split()[1:]))
 
     return super(SubjectRenderer, self).Layout(request, response)
+
+
+class RDFBytesRenderer(RDFValueRenderer):
+  """A renderer for RDFBytes."""
+  classname = "RDFBytes"
+
+  def Layout(self, request, response):
+    self.proxy = utils.SmartStr(self.proxy).encode("string-escape")
+    super(RDFBytesRenderer, self).Layout(request, response)
 
 
 class RDFURNRenderer(RDFValueRenderer):
@@ -326,15 +341,6 @@ class RDFValueArrayRenderer(RDFValueRenderer):
 {% endif %}
 </tbody>
 </table>
-<script>
- $("#{{unique}} a").click(function () {
-   grr.layout("RDFValueArrayRenderer", "{{unique}}", {
-     start: "{{this.next_start}}",
-     cache: "{{this.cache.urn}}",
-     length: "{{this.length}}"
-   });
- });
-</script>
 """)
 
   def Layout(self, request, response):
@@ -362,6 +368,7 @@ class RDFValueArrayRenderer(RDFValueRenderer):
 
     self.data = []
 
+    self.next_start = 0
     for i, element in enumerate(self.proxy):
       if i < start:
         continue
@@ -379,7 +386,13 @@ class RDFValueArrayRenderer(RDFValueRenderer):
           logging.error(
               "Unable to render %s with %s: %s", type(element), renderer, e)
 
-    return super(RDFValueArrayRenderer, self).Layout(request, response)
+    response = super(RDFValueArrayRenderer, self).Layout(request, response)
+    if self.next_start:
+      response = self.CallJavascript(response, "RDFValueArrayRenderer.Layout",
+                                     next_start=self.next_start,
+                                     cache_urn=self.cache.urn,
+                                     array_length=self.length)
+    return response
 
 
 class DictRenderer(RDFValueRenderer):
@@ -447,7 +460,8 @@ class IconRenderer(RDFValueRenderer):
   width = 0
   layout_template = renderers.Template("""
 <div class="centered">
-<img class='grr-icon' src='/static/images/{{this.proxy.icon}}.png'
+<img class='grr-icon {{this.proxy.icon}}'
+ src='/static/images/{{this.proxy.icon}}.png'
  alt='{{this.proxy.description}}' title='{{this.proxy.description}}'
  /></div>""")
 
@@ -457,6 +471,14 @@ class RDFValueCollectionRenderer(renderers.TableRenderer):
 
   post_parameters = ["aff4_path"]
   size = 0
+  show_total_count = True
+  layout_template = """
+{% if this.size > 0 %}
+  {% if this.show_total_count %}
+    <h5>{{this.size}} Entries</h5>
+  {% endif %}
+{% endif %}
+""" + renderers.TableRenderer.layout_template
 
   def __init__(self, **kwargs):
     super(RDFValueCollectionRenderer, self).__init__(**kwargs)
@@ -482,6 +504,13 @@ class RDFValueCollectionRenderer(renderers.TableRenderer):
   def Layout(self, request, response, aff4_path=None):
     if aff4_path:
       self.state["aff4_path"] = str(aff4_path)
+      try:
+        collection = aff4.FACTORY.Open(aff4_path,
+                                       aff4_type="RDFValueCollection",
+                                       token=request.token)
+        self.size = len(collection)
+      except IOError:
+        pass
 
     return super(RDFValueCollectionRenderer, self).Layout(
         request, response)
@@ -498,18 +527,13 @@ Open a graph showing the download progress in a new window:
 <button id="{{ unique|escape }}">
  Generate
 </button>
-<script>
-  var button = $("#{{ unique|escapejs }}").button();
-
-  var state = {flow_id: '{{this.flow_id|escapejs}}'};
-  grr.downloadHandler(button, state, false,
-                      '/render/Download/ProgressGraphRenderer');
-</script>
 """)
 
   def Layout(self, request, response):
     self.flow_id = request.REQ.get("flow")
-    return super(ProgressButtonRenderer, self).Layout(request, response)
+    response = super(ProgressButtonRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "ProgressButtonRenderer.Layout",
+                               flow_id=self.flow_id)
 
 
 class FlowStateRenderer(DictRenderer):
@@ -537,14 +561,13 @@ class AES128KeyFormRenderer(forms.StringTypeFormRenderer):
     />
   </div>
 </div>
-<script>
-$("#{{this.prefix}}").change();
-</script>
 """
 
   def Layout(self, request, response):
     self.default = str(self.descriptor.type().Generate())
-    return super(AES128KeyFormRenderer, self).Layout(request, response)
+    response = super(AES128KeyFormRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "AES128KeyFormRenderer.Layout",
+                               prefix=self.prefix)
 
 
 class ClientURNRenderer(RDFValueRenderer):

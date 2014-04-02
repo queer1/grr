@@ -165,9 +165,8 @@ message SignedMessageList {
   // This is a serialized MessageList for signing
   optional bytes message_list = 1;
 
-  // BEGIN DEPRECATED
-  optional bytes signature = 2;
-  // END DEPRECATED
+  // DEPRECATED
+  // optional bytes signature = 2;
 
   optional string source = 3 [(sem_type) = {
       type: "RDFURN",
@@ -187,11 +186,26 @@ message CipherProperties {
 
   required bytes key = 2;
 
-  // This is used to encrypt the cipher metadata block.
-  optional bytes iv = 3;
+  // This IV is used to encrypt the cipher metadata block. Note: Both the
+  // CipherProperties() and the CipherMetadata() protobufs do not change for all
+  // messages in this session.
+  optional bytes metadata_iv = 3;
 
   // The key used for the hmac.
   optional bytes hmac_key = 5;
+
+  enum HMACType {
+    // Older clients use a HMAC only on the encrypted message.
+    SIMPLE_HMAC = 0;
+
+    // Newer clients also include the encrypted cipher and API version in the
+    // hmac.
+    FULL_HMAC = 1;
+  };
+
+  // The API version of the cipher.
+  optional HMACType hmac_type = 6 [default=SIMPLE_HMAC];
+
 };
 
 message CipherMetadata {
@@ -204,16 +218,26 @@ message CipherMetadata {
   optional bytes signature = 2;
 };
 
+// Next field: 11
 message ClientCommunication {
+  // This message is a serialzed SignedMessageList() protobuf, encrypted using
+  // the session key (Encrypted inside field 2) and the per-packet IV (field 8).
   optional bytes encrypted = 1;
 
-  // This is a CipherProperties protobuf encrypted with the public key of the
-  // receiver.
+  // This is a CipherProperties() protobuf encrypted with the public key of the
+  // receiver. Contains the session key and iv, as well as hmac key. This IV
+  // does not change for the duration of the session. It is used to decrypt the
+  // CipherMetadata() (field 9).
   optional bytes encrypted_cipher = 2;
+
+  // A serialized CipherMetadata() protobuf, encrypted with the session
+  // key. Contains the RSA signature of the digest of the serialized
+  // CipherProperties() above, signed with the sender's private key.
   optional bytes encrypted_cipher_metadata = 9;
 
-  // This iv is used to encrypt the encrypted field.
-  optional bytes iv = 8;
+  // This iv is used to encrypt the encrypted field (No. 1). This IV changes for
+  // each packet.
+  optional bytes packet_iv = 8;
 
   optional HttpRequest orig_request = 3;
 
@@ -232,9 +256,20 @@ message ClientCommunication {
 
   optional uint32 api_version = 6;
 
-  // Protocol Version >= 3: This field contains the hmac of the message with the
-  // cipher key.
+  // The choice of which hmac is used is set in the CipherProperties() protocol
+  // buffer. A full hmac is more secure and is the new default, but we can still
+  // support the old hmac for backwards compatibility.
+
+  // This is the SIMPLE_HMAC. It covers the "encrypted" field only.
   optional bytes hmac = 7;
+
+  // This is the FULL_HMAC. It coverts:
+  // 1) the "encrypted" field,
+  // 2) The "encrypted_cipher" field.
+  // 3) The encrypted_cipher_metadata field
+  // 4) The packet iv
+  // 5) the api_version.
+  optional bytes full_hmac = 10;
 };
 
 // This is a status response that is sent for each complete
@@ -911,102 +946,6 @@ message MemoryInformation {
   optional uint64 cr3 = 3;
 }
 
-message ServiceInformation {
-  option (semantic) = {
-    description: "Describe a windows service or driver. Field names follow"
-    " the cybox naming scheme where possible: "
-    "http://cybox.mitre.org/language/version2.0.1/xsddocs/objects/Win_Service_Object.html",
-  };
-
-  optional string name = 1 [(sem_type) = {
-      description: "The name of the service.",
-    }];
-
-  optional string description = 2 [(sem_type) = {
-      description: "The description string of the service.",
-    }];
-
-  optional StatEntry binary = 3 [(sem_type) = {
-      description: "The binary on the client. This may also contain an AFF4 "
-      "urn to the server copy of the same file.",
-    }];
-
-  optional string state = 4 [(sem_type) = {
-      description: "Current state of the service.",
-    }];
-
-  optional Dict wmi_information = 5 [(sem_type) = {
-      description: "Additional information available through WMI.",
-    }];
-
-  optional string display_name = 6 [(sem_type) = {
-      description: "Displayed name of the service in Windows GUI controls.",
-    }];
-
-  optional string driver_package_id = 7 [(sem_type) = {
-      description: "Driver Package ID of the service.",
-    }];
-
-  enum ErrorControl {
-    CRITICAL = 3;
-    SEVERE = 2;
-    NORMAL = 1;
-    IGNORE = 0;
-  };
-
-  optional ErrorControl error_control = 8 [(sem_type) = {
-      description: "Behaviour of the service on failure to load/initialize",
-    }];
-
-  optional string image_path = 9 [(sem_type) = {
-      description: "ImagePath of the service.",
-    }];
-
-  optional string object_name = 10 [(sem_type) = {
-      description: "ObjectName of the service.",
-    }];
-
-  enum ServiceMode {
-    SERVICE_BOOT_START = 0;
-    SERVICE_SYSTEM_START = 1;
-    SERVICE_AUTO_START = 2;
-    SERVICE_DEMAND_START = 3;
-    SERVICE_DISABLED = 4;
-  };
-
-  optional ServiceMode startup_type = 11 [(sem_type) = {
-      description: "Service start options",
-    }];
-
-  enum ServiceType {
-    SERVICE_KERNEL_DRIVER = 0x1;
-    SERVICE_FILE_SYSTEM_DRIVER = 0x2;
-    SERVICE_ADAPTER_ARGS = 0x4;
-    SERVICE_WIN32_OWN_PROCESS = 0x10;
-    SERVICE_WIN32_SHARE_PROCESS = 0x20;
-  };
-
-  optional ServiceType service_type = 12 [(sem_type) = {
-      description: "Type of the service.",
-    }];
-
-  optional string group_name = 13 [(sem_type) = {
-      description: "Specifies the name of the load ordering group of which "
-      "this service is a member.",
-    }];
-
-  optional string service_dll = 14 [(sem_type) = {
-      description: "Name of the DLL instantiated in the service.",
-    }];
-
-  optional string registry_key = 15 [(sem_type) = {
-      type: "RDFURN",
-      description: "The AFF4 location for the service registry key."
-    }];
-
-}
-
-
 // Updates the client configuration. We deliberately only allow to update a few
 // options. Setting these should take effect immediately.
 
@@ -1286,6 +1225,7 @@ message GrepSpec {
 
   // A literal search.
   optional bytes literal = 5 [(sem_type) = {
+      type: "LiteralExpression",
       description: "Search for this literal string.",
     }];
 
@@ -1587,7 +1527,7 @@ message Notification {
 
 // This is a way to serialize an arbitrary RDFValue.
 message EmbeddedRDFValue {
-  optional uint64 age = 1 [(sem_type) = {
+  optional uint64 embedded_age = 1 [(sem_type) = {
       type: "RDFDatetime",
       description: "The age of this RDFValue."
     }];
@@ -1618,10 +1558,22 @@ message AuditEvent {
   enum Action {
     UNKNOWN = 0;
     RUN_FLOW = 1;
+    CLIENT_APPROVAL_BREAK_GLASS_REQUEST = 2;
+    CLIENT_APPROVAL_GRANT = 3;
+    CLIENT_APPROVAL_REQUEST = 4;
+    CRON_APPROVAL_GRANT = 5;
+    CRON_APPROVAL_REQUEST = 6;
+    HUNT_APPROVAL_GRANT = 7;
+    HUNT_APPROVAL_REQUEST = 8;
+    HUNT_CREATED = 9;
+    HUNT_MODIFIED = 10;
+    HUNT_PAUSED = 11;
+    HUNT_STARTED = 12;
+    HUNT_STOPPED = 13;
   };
 
   optional Action action = 3 [default=UNKNOWN];
-  optional string flow = 4;
+  optional string flow_name = 4;
   optional bytes flow_args = 5;
 
   optional string client = 6 [(sem_type) = {
@@ -1632,6 +1584,12 @@ message AuditEvent {
   optional uint64 timestamp = 7 [(sem_type) = {
       type: "RDFDatetime",
       description: "Time event was created.",
+    }];
+
+  optional string description = 8;
+  optional string urn = 9 [(sem_type) = {
+      type: "RDFURN",
+      description: "The relevant hunt/flow/cron urn for this event."
     }];
 }
 
@@ -1691,7 +1649,7 @@ message PersistenceFile {
   optional string source_urn = 2  [(sem_type) = {
     type: "RDFURN",
     description: "URN for rdfvalue that used this file for "
-        " persistence. e.g. ServiceInformation, StatEntry."
+        " persistence. e.g. WindowsServiceInformation, StatEntry."
   }];
 }
 

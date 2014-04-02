@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
 """A generic serializer for python dictionaries."""
 
 
@@ -144,8 +143,18 @@ class Dict(rdfvalue.RDFProtoStruct):
     for x in self.dat:
       yield x.k.GetValue(), x.v.GetValue()
 
-  get = utils.Proxy("Get")
+  def Values(self):
+    for x in self.dat:
+      yield x.v.GetValue()
+
+  def Keys(self):
+    for x in self.dat:
+      yield x.k.GetValue()
+
+  get = utils.Proxy("GetItem")
   items = utils.Proxy("Items")
+  keys = utils.Proxy("Keys")
+  values = utils.Proxy("Values")
 
   def __delitem__(self, key):
     for i, x in enumerate(self.dat):
@@ -294,7 +303,7 @@ class EmbeddedRDFValue(rdfvalue.RDFProtoStruct):
 
     super(EmbeddedRDFValue, self).__init__(initializer=initializer, *args,
                                            **kwargs)
-    if payload:
+    if payload is not None:
       self.payload = payload
 
   @property
@@ -303,7 +312,7 @@ class EmbeddedRDFValue(rdfvalue.RDFProtoStruct):
     try:
       rdf_cls = self.classes.get(self.name)
       value = rdf_cls(self.data)
-      value.age = self.age
+      value.age = self.embedded_age
 
       return value
     except TypeError:
@@ -312,5 +321,5 @@ class EmbeddedRDFValue(rdfvalue.RDFProtoStruct):
   @payload.setter
   def payload(self, payload):
     self.name = payload.__class__.__name__
-    self.age = payload.age
+    self.embedded_age = payload.age
     self.data = payload.SerializeToString()

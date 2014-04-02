@@ -398,6 +398,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
   def WriteImage(self, path, prefix="Test", timestamp=0):
     with test_lib.Stubber(time, "time", lambda: timestamp):
       fd = aff4.FACTORY.Create(path, "AFF4Image", mode="w", token=self.token)
+
       timestamp += 1
       fd.SetChunksize(10)
 
@@ -433,6 +434,42 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     for i in range(100):
       s = "Time2%08X\n" % i
       self.assertEqual(fd.Read(len(s)), s)
+
+  def testAFF4ImageContentLastUpdated(self):
+    """Make sure CONTENT_LAST gets updated only when content is written."""
+    path = "/C.12345/contentlastchecker"
+
+    self.WriteImage(path, timestamp=1)
+
+    fd = aff4.FACTORY.Open(path, token=self.token)
+    # Make sure the attribute was written when the write occured.
+    self.assertEqual(int(fd.GetContentAge()), 101000000)
+
+    # Write the image again, later in time.
+    self.WriteImage(path, timestamp=2)
+
+    fd = aff4.FACTORY.Open(path, token=self.token)
+    self.assertEqual(int(fd.GetContentAge()), 102000000)
+
+  def testAFF4ImageContentLastNotUpdated(self):
+    """Make sure CONTENT_LAST does not update when only STAT is written.."""
+    path = "/C.12345/contentlastchecker"
+
+    self.WriteImage(path, timestamp=1)
+
+    fd = aff4.FACTORY.Open(path, token=self.token)
+    # Make sure the attribute was written when the write occured.
+    self.assertEqual(int(fd.GetContentAge()), 101000000)
+
+    # Write the stat (to be the same as before, but this still counts
+    # as a write).
+    fd.Set(fd.Schema.STAT, fd.Get(fd.Schema.STAT))
+    fd.Flush()
+
+    fd = aff4.FACTORY.Open(path, token=self.token)
+
+    # The age of the content should still be the same.
+    self.assertEqual(int(fd.GetContentAge()), 101000000)
 
   def testAFF4FlowObject(self):
     """Test the AFF4 Flow switch and object."""
@@ -472,7 +509,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     client_id = "C.%016X" % 0
     test_lib.ClientFixture(client_id, token=self.token)
 
-    fd = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id).Add(
+    fd = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id).Add(
         "/fs/os/c"), token=self.token)
 
     # Test that we can match a unicode char
@@ -490,7 +527,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
                      u"fs/os/c/regex.*?][{}--")
 
     # Test the OpenChildren function on files that contain regex chars.
-    fd = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id).Add(
+    fd = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id).Add(
         r"/fs/os/c/regex\V.*?]xx[{}--"), token=self.token)
 
     children = list(fd.OpenChildren())
@@ -498,7 +535,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     self.assertTrue("regexchild" in utils.SmartUnicode(children[0].urn))
 
     # Test that OpenChildren works correctly on Unicode names.
-    fd = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id).Add(
+    fd = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id).Add(
         "/fs/os/c"), token=self.token)
 
     children = list(fd.OpenChildren())
@@ -510,7 +547,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     self.assertTrue(u"aff4:/C.0000000000000000/fs/os/c/中国新闻网新闻中"
                     in urns)
 
-    fd = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id).Add(
+    fd = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id).Add(
         "/fs/os/c/中国新闻网新闻中"), token=self.token)
 
     children = list(fd.OpenChildren())
@@ -519,7 +556,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     self.assertEqual(child.Get(child.Schema.TYPE), "VFSFile")
 
     # This tests filtering through the AFF4Filter.
-    fd = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id).Add(
+    fd = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id).Add(
         "/fs/os/c/bin %s" % client_id), token=self.token)
 
     matched = list(fd.Query(
@@ -540,17 +577,17 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     client_id = "C.%016X" % 0
     test_lib.ClientFixture(client_id, token=self.token)
 
-    file_url = aff4.ROOT_URN.Add(client_id).Add("/fs/os/c/time/file.txt")
+    file_url = rdfvalue.ClientURN(client_id).Add("/fs/os/c/time/file.txt")
     for t in [1000, 1500, 2000, 2500]:
-      with test_lib.Stubber(time, "time", lambda: t):
+      with test_lib.FakeTime(t):
         f = aff4.FACTORY.Create(rdfvalue.RDFURN(file_url), "VFSFile",
                                 token=self.token)
         f.write(str(t))
         f.Close()
 
     # The following tests occur sometime in the future (time 3000).
-    with test_lib.Stubber(time, "time", lambda: 3000):
-      fd = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id).Add(
+    with test_lib.FakeTime(3000):
+      fd = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id).Add(
           "/fs/os/c/time"), token=self.token)
 
       # Query for all entries.
@@ -610,7 +647,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
         current_time +
         config_lib.CONFIG["AFF4.notification_rules_cache_age"] + 1)
 
-    with test_lib.Stubber(time, "time", lambda: time_in_future):
+    with test_lib.FakeTime(time_in_future):
       fd = aff4.FACTORY.Create(
           rdfvalue.RDFURN("aff4:/some"),
           aff4_type="AFF4Object",
@@ -718,6 +755,58 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
                          [client1_urn.Add("some1")])
     self.assertListEqual(children[client2_urn],
                          [client2_urn.Add("some2")])
+
+  def testIndexNotUpdatedWhenWrittenWithinIntermediateCacheAge(self):
+    with test_lib.Stubber(time, "time", lambda: 100):
+      fd = aff4.FACTORY.Create(
+          self.client_id.Add("parent").Add("child1"),
+          aff4_type="AFF4Volume", token=self.token)
+      fd.Close()
+
+    fd = aff4.FACTORY.Open(self.client_id, token=self.token)
+    children = list(fd.ListChildren())
+    self.assertEqual(len(children), 1)
+    self.assertEqual(children[0].age,
+                     rdfvalue.RDFDatetime().FromSecondsFromEpoch(100))
+
+    latest_time = 100 + config_lib.CONFIG["AFF4.intermediate_cache_age"] - 1
+    with test_lib.Stubber(time, "time", lambda: latest_time):
+      fd = aff4.FACTORY.Create(
+          self.client_id.Add("parent").Add("child2"),
+          aff4_type="AFF4Volume", token=self.token)
+      fd.Close()
+
+    fd = aff4.FACTORY.Open(self.client_id, token=self.token)
+    children = list(fd.ListChildren())
+    self.assertEqual(len(children), 1)
+    self.assertEqual(children[0].age,
+                     rdfvalue.RDFDatetime().FromSecondsFromEpoch(100))
+
+  def testIndexUpdatedWhenWrittenAfterIntemediateCacheAge(self):
+    with test_lib.Stubber(time, "time", lambda: 100):
+      fd = aff4.FACTORY.Create(
+          self.client_id.Add("parent").Add("child1"),
+          aff4_type="AFF4Volume", token=self.token)
+      fd.Close()
+
+    fd = aff4.FACTORY.Open(self.client_id, token=self.token)
+    children = list(fd.ListChildren())
+    self.assertEqual(len(children), 1)
+    self.assertEqual(children[0].age,
+                     rdfvalue.RDFDatetime().FromSecondsFromEpoch(100))
+
+    latest_time = 100 + config_lib.CONFIG["AFF4.intermediate_cache_age"] + 1
+    with test_lib.Stubber(time, "time", lambda: latest_time):
+      fd = aff4.FACTORY.Create(
+          self.client_id.Add("parent").Add("child2"),
+          aff4_type="AFF4Volume", token=self.token)
+      fd.Close()
+
+    fd = aff4.FACTORY.Open(self.client_id, token=self.token)
+    children = list(fd.ListChildren())
+    self.assertEqual(len(children), 1)
+    self.assertEqual(children[0].age,
+                     rdfvalue.RDFDatetime().FromSecondsFromEpoch(latest_time))
 
   def testClose(self):
     """Ensure that closed objects can not be used again."""
@@ -837,7 +926,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
       self.assertRaises(aff4.LockError, TryOpen)
 
   def testLockHasLimitedLeaseTime(self):
-    with test_lib.Stubber(time, "time", lambda: 100):
+    with test_lib.FakeTime(100):
       client = aff4.FACTORY.Create(self.client_id, "VFSGRRClient", mode="w",
                                    token=self.token)
       client.Set(client.Schema.HOSTNAME("client1"))
@@ -872,7 +961,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     self.assertRaises(aff4.LockError, client.UpdateLease, 100)
 
   def testUpdateLeaseRaisesIfLeaseHasExpired(self):
-    with test_lib.Stubber(time, "time", lambda: 100):
+    with test_lib.FakeTime(100):
       client = aff4.FACTORY.Create(self.client_id, "VFSGRRClient", mode="w",
                                    token=self.token)
       client.Set(client.Schema.HOSTNAME("client1"))
@@ -890,7 +979,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
         pass
 
   def testCheckLease(self):
-    with test_lib.Stubber(time, "time", lambda: 100):
+    with test_lib.FakeTime(100):
       client = aff4.FACTORY.Create(self.client_id, "VFSGRRClient", mode="w",
                                    token=self.token)
       client.Set(client.Schema.HOSTNAME("client1"))
@@ -904,7 +993,7 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
           self.assertEqual(fd.CheckLease(), 0)
 
   def testUpdateLeaseWorksCorrectly(self):
-    with test_lib.Stubber(time, "time", lambda: 100):
+    with test_lib.FakeTime(100):
       client = aff4.FACTORY.Create(self.client_id, "VFSGRRClient", mode="w",
                                    token=self.token)
       client.Set(client.Schema.HOSTNAME("client1"))
@@ -985,6 +1074,25 @@ class AFF4Tests(test_lib.AFF4ObjectTest):
     client1.Flush()
     index_results = label_index.Query([client_schema.LABEL], "label1")
     self.assertEquals(index_results, [])
+
+  def testPathSpecInterpolation(self):
+    # Create a base directory containing a pathspec.
+    os_urn = rdfvalue.RDFURN("aff4:/C.0000000000000002/fs/os")
+    pathspec = rdfvalue.PathSpec(
+        path="/", pathtype=rdfvalue.PathSpec.PathType.OS)
+    additional_path = "/var/log"
+    fd = aff4.FACTORY.Create(os_urn, "VFSDirectory", token=self.token)
+    fd.Set(fd.Schema.PATHSPEC(pathspec))
+    fd.Close()
+
+    # Now we open a path below this aff4 directory.
+    fd = aff4.FACTORY.Create(os_urn.Add(additional_path), "VFSDirectory",
+                             mode="rw", token=self.token)
+    flow_id = fd.Update(attribute=fd.Schema.CONTAINS)
+
+    flow_obj = aff4.FACTORY.Open(flow_id, token=self.token)
+    self.assertEqual(flow_obj.args.pathspec.pathtype, pathspec.pathtype)
+    self.assertEqual(flow_obj.args.pathspec.path, additional_path)
 
 
 class AFF4SymlinkTestSubject(aff4.AFF4Volume):
@@ -1229,9 +1337,7 @@ class ForemanTests(test_lib.AFF4ObjectTest):
       self.assertEqual(self.clients_launched[3][1], eq_flow)
 
   def testRuleExpiration(self):
-    self.mock_time = 1000
-
-    with test_lib.Stubber(time, "time", lambda: self.mock_time):
+    with test_lib.FakeTime(1000):
       foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw", token=self.token)
 
       rules = []
@@ -1263,10 +1369,10 @@ class ForemanTests(test_lib.AFF4ObjectTest):
       foreman.Set(foreman.Schema.RULES, rule_set)
       foreman.Close()
 
-      fd = aff4.FACTORY.Create(client_id, "VFSGRRClient",
-                               token=self.token)
-      for now, num_rules in [(1000, 4), (1250, 3), (1350, 2), (1600, 0)]:
-        self.mock_time = now
+    fd = aff4.FACTORY.Create(client_id, "VFSGRRClient",
+                             token=self.token)
+    for now, num_rules in [(1000, 4), (1250, 3), (1350, 2), (1600, 0)]:
+      with test_lib.FakeTime(now):
         fd.Set(fd.Schema.LAST_FOREMAN_TIME(100))
         fd.Flush()
         foreman = aff4.FACTORY.Open("aff4:/foreman", mode="rw",

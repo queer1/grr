@@ -17,18 +17,34 @@ class SearchFileContentArgs(rdfvalue.RDFProtoStruct):
 class SearchFileContent(flow.GRRFlow):
   """A flow that runs a glob first and then issues a grep on the results.
 
-  This flow can be used to search for files by filename. Simply specify a glob
-  expression for the filename:
+  DEPRECATED.
+  This flow is now deprecated in favor of FileFinder. To use FileFinder instead
+  of SearchFileContent:
+  Specify list of glob expressions corresponding to the files you want to
+  search in. Add conditions that will be applied to found files. You can
+  use "literal match" and "regex match" conditions. Set "action" to
+  "Stat" if you're just interested in matches, or "Download" if you want to
+  also download the matching files.
+  ------------------------------------------------------------------------------
 
-  %%KnowledgeBase.environ_windir%%/notepad.exe
+  This flow can be used to search for files by specifying a filename glob.
+  e.g. this glob will search recursively under the environment directory for
+  files called notepad with any extension:
 
-  By also specifying a grep specification, the file contents can also be
-  searched.
+  %%KnowledgeBase.environ_windir%%/**notepad.*
+
+  The default ** recursion depth is 3 levels, and can be modified using a number
+  after the ** like this:
+
+  %%KnowledgeBase.environ_windir%%/**10notepad.*
+
+  Optionally you can also specify File Content Search parameters to search file
+  contents.
   """
   category = "/Filesystem/"
   friendly_name = "Search In Files"
   args_type = rdfvalue.SearchFileContentArgs
-  behaviours = flow.GRRFlow.behaviours + "BASIC"
+  behaviours = flow.GRRFlow.behaviours + "ADVANCED"
 
   @classmethod
   def GetDefaultArgs(cls, token=None):
@@ -46,10 +62,10 @@ class SearchFileContent(flow.GRRFlow):
       self.runner.output.Set(self.runner.output.Schema.DESCRIPTION(
           "SearchFiles {0}".format(self.__class__.__name__)))
 
-    self.CallFlow("Glob", next_state="Grep",
+    self.CallFlow("Glob", next_state="Grep", root_path=self.args.root_path,
                   paths=self.args.paths, pathtype=self.args.pathtype)
 
-  @flow.StateHandler(next_state=["WriteHits", "End"])
+  @flow.StateHandler(next_state=["WriteHits"])
   def Grep(self, responses):
     if responses.success:
       # Grep not specified - just list all hits.

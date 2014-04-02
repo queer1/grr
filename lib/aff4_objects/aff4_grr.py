@@ -167,6 +167,10 @@ class VFSGRRClient(standard.VFSDirectory):
                    rdfvalue.PathSpec.PathType.MEMORY: "/devices/memory"}
 
   @staticmethod
+  def ClientURNFromURN(urn):
+    return rdfvalue.ClientURN(rdfvalue.RDFURN(urn).Split()[0])
+
+  @staticmethod
   def PathspecToURN(pathspec, client_urn):
     """Returns a mapping between a pathspec and an AFF4 URN.
 
@@ -317,9 +321,9 @@ class VFSFile(aff4.AFF4Image):
 
     # Get the pathspec for this object
     pathspec = self.Get(self.Schema.STAT).pathspec
-    flow_urn = flow.GRRFlow.StartFlow(client_id=client_id,
-                                      flow_name="GetFile", token=self.token,
-                                      pathspec=pathspec, priority=priority)
+    flow_urn = flow.GRRFlow.StartFlow(
+        client_id=client_id, flow_name="MultiGetFile", token=self.token,
+        pathspecs=[pathspec], priority=priority)
     self.Set(self.Schema.CONTENT_LOCK(flow_urn))
     self.Close()
 
@@ -504,7 +508,7 @@ class GRRForeman(aff4.AFF4Object):
                          action.hunt_id, client_id)
 
             flow_cls = flow.GRRFlow.classes[action.hunt_name]
-            flow_cls.StartClient(action.hunt_id, client_id)
+            flow_cls.StartClients(action.hunt_id, [client_id])
             actions_count += 1
         else:
           flow.GRRFlow.StartFlow(

@@ -431,11 +431,10 @@ class ProtoUnsignedInteger(ProtoType):
     super(ProtoUnsignedInteger, self).__init__(default=default, **kwargs)
 
   def Validate(self, value, **_):
-    if not (value.__class__ is int or value.__class__ is long or
-            value.__class__ is rdfvalue.RDFInteger):
+    try:
+      return int(value)
+    except ValueError:
       raise type_info.TypeValueError("Invalid value %s for Integer" % value)
-
-    return value
 
   def Write(self, stream, value):
     stream.write(self.tag_data)
@@ -564,11 +563,15 @@ class Enum(int):
   Enums are just integers, except when printed they have a name.
   """
 
-  def __new__(cls, val, name=None):
+  def __new__(cls, val, name=None, description=None):
     instance = super(Enum, cls).__new__(cls, val)
     instance.name = name or str(val)
+    instance.description = description
 
     return instance
+
+  def __eq__(self, other):
+    return int(self) == other or self.name == other
 
   def __str__(self):
     return self.name
@@ -583,7 +586,8 @@ class ProtoEnum(ProtoSignedInteger):
   This is really encoded as an integer but only certain values are allowed.
   """
 
-  def __init__(self, default=None, enum_name=None, enum=None, **kwargs):
+  def __init__(self, default=None, enum_name=None, enum=None,
+               enum_descriptions=None, **kwargs):
     super(ProtoEnum, self).__init__(**kwargs)
     if enum_name is None:
       raise type_info.TypeValueError("Enum groups must be given a name.")
@@ -593,14 +597,14 @@ class ProtoEnum(ProtoSignedInteger):
     if isinstance(enum, EnumContainer):
       enum = enum.enum_dict
 
-    self.enum = enum or {}
-    self.enum_container = EnumContainer(name=enum_name, **self.enum)
-    self.reverse_enum = {}
-    for k, v in enum.iteritems():
+    for v in enum.itervalues():
       if not (v.__class__ is int or v.__class__ is long):
         raise type_info.TypeValueError("Enum values must be integers.")
 
-      self.reverse_enum[v] = k
+    self.enum_container = EnumContainer(
+        name=enum_name, descriptions=enum_descriptions, **(enum or {}))
+    self.enum = self.enum_container.enum_dict
+    self.reverse_enum = self.enum_container.reverse_enum
 
     # Ensure the default is a valid enum value.
     if default is not None:
@@ -613,14 +617,15 @@ class ProtoEnum(ProtoSignedInteger):
       return
 
     # If the value is a string we need to try to convert it to an integer.
+    checked_value = value
     if value.__class__ is str:
-      value = self.enum.get(value)
-      if value is None:
+      checked_value = self.enum.get(value)
+      if checked_value is None:
         raise type_info.TypeValueError(
             "Value %s is not a valid enum value for field %s" % (
                 value, self.name))
 
-    return Enum(value, name=self.reverse_enum.get(value))
+    return Enum(checked_value, name=self.reverse_enum.get(value))
 
   def Definition(self):
     """Return a string with the definition of this field."""
@@ -1818,31 +1823,21 @@ class ProtocolBufferSerializer(AbstractSerlializer):
     self.protobuf.ReadIntoObject(string, 0, value_obj)
 
 
-class EnumValue(int):
-  """An integer with a name."""
-
-  def __new__(cls, val, name=None):
-    inst = super(EnumValue, cls).__new__(cls, val)
-    inst.name = name
-    return inst
-
-  def __str__(self):
-    return self.name
-
-
 class EnumContainer(object):
   """A data class to hold enum objects."""
 
-  def __init__(self, name=None, **kwargs):
+  def __init__(self, name=None, descriptions=None, **kwargs):
+    descriptions = descriptions or {}
+
+    self.enum_dict = {}
     self.reverse_enum = {}
     self.name = name
 
     for k, v in kwargs.items():
-      v = EnumValue(v, name=k)
+      v = Enum(v, name=k, description=descriptions.get(k, None))
+      self.enum_dict[k] = v
       self.reverse_enum[v] = k
       setattr(self, k, v)
-
-    self.enum_dict = kwargs
 
 
 class RDFProtoStruct(RDFStruct):

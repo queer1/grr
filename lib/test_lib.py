@@ -19,11 +19,13 @@ import tempfile
 import threading
 import time
 import unittest
+import urlparse
 
 
 from M2Crypto import X509
 
 from selenium.common import exceptions
+from selenium.webdriver.common import action_chains
 from selenium.webdriver.common import keys
 from selenium.webdriver.support import select
 
@@ -427,6 +429,7 @@ class GRRBaseTest(unittest.TestCase):
       raise TimeoutError()
 
     exited = False
+    proc = None
     try:
       logging.info("Running : %s", [cmd] + argv)
       proc = subprocess.Popen([cmd] + argv, stdout=subprocess.PIPE,
@@ -452,7 +455,8 @@ class GRRBaseTest(unittest.TestCase):
     finally:
       signal.alarm(0)
       try:
-        proc.kill()
+        if proc:
+          proc.kill()
       except OSError:
         pass   # Could already be dead.
 
@@ -512,9 +516,37 @@ class EmptyActionTest(GRRBaseTest):
     if arg is None:
       arg = rdfvalue.GrrMessage()
 
-    message = rdfvalue.GrrMessage(name=action_name,
-                                  payload=arg)
+    results = []
+
+    # A mock SendReply() method to collect replies.
+    def MockSendReply(self, reply=None, **kwargs):
+      if reply is None:
+        reply = self.out_rdfvalue(**kwargs)
+
+      results.append(reply)
+
+    message = rdfvalue.GrrMessage(name=action_name, payload=arg)
     action_cls = actions.ActionPlugin.classes[message.name]
+    with Stubber(action_cls, "SendReply", MockSendReply):
+      action = action_cls(message=message)
+      action.grr_worker = FakeClientWorker()
+      action.Run(arg)
+
+    return results
+
+  def ExecuteAction(self, action_name, arg=None):
+    """Run an action and generate responses.
+
+    Opposed to RunAction, this also runs the accounting and exception catching
+    code and returns GrrStatus messages along with the responses.
+
+    Args:
+       action_name: The action to run.
+       arg: A protobuf to pass the action.
+
+    Returns:
+      A list of response protobufs.
+    """
     results = []
 
     # Monkey patch a mock SendReply() method
@@ -524,15 +556,14 @@ class EmptyActionTest(GRRBaseTest):
 
       results.append(reply)
 
-    old_sendreply = action_cls.SendReply
-    try:
-      action_cls.SendReply = MockSendReply
-
+    authenticated = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
+    message = rdfvalue.GrrMessage(name=action_name, payload=arg,
+                                  auth_state=authenticated)
+    action_cls = actions.ActionPlugin.classes[message.name]
+    with Stubber(action_cls, "SendReply", MockSendReply):
       action = action_cls(message=message)
       action.grr_worker = FakeClientWorker()
-      action.Run(arg)
-    finally:
-      action_cls.SendReply = old_sendreply
+      action.Execute()
 
     return results
 
@@ -625,6 +656,20 @@ class MultiStubber(object):
       x.__exit__(t, value, traceback)
 
 
+class FakeTime(object):
+  """A context manager for faking time."""
+
+  def __init__(self, fake_time):
+    self.time = fake_time
+
+  def __enter__(self):
+    self.old_time = time.time
+    time.time = lambda: self.time
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    time.time = self.old_time
+
+
 class Instrument(object):
   """A helper to instrument a function call.
 
@@ -637,11 +682,13 @@ class Instrument(object):
     def Wrapper(*args, **kwargs):
       self.args.append(args)
       self.kwargs.append(kwargs)
+      self.call_count += 1
       return self.old_target(*args, **kwargs)
 
     self.stubber = Stubber(module, target_name, Wrapper)
     self.args = []
     self.kwargs = []
+    self.call_count = 0
 
   def __enter__(self):
     self.stubber.__enter__()
@@ -783,6 +830,19 @@ class GRRSeleniumTest(GRRBaseTest):
   def Open(self, url):
     self.driver.get(self.base_url + url)
 
+    # Sometimes page doesn't get refreshed if url's path and query haven't
+    # changed, even if fragments part (part after '#' symbol) of the url has
+    # changed. We have to explicitly call Refresh() in such cases.
+    prev_parsed_url = urlparse.urlparse(self.driver.current_url)
+    new_parsed_url = urlparse.urlparse(url)
+    if (prev_parsed_url.path == new_parsed_url.path and
+        prev_parsed_url.query == new_parsed_url.query):
+      self.Refresh()
+
+  @SeleniumAction
+  def Refresh(self):
+    self.driver.refresh()
+
   def WaitUntilNot(self, condition_cb, *args):
     self.WaitUntil(lambda: not condition_cb(*args))
 
@@ -862,6 +922,18 @@ class GRRSeleniumTest(GRRBaseTest):
     self.WaitForAjaxCompleted()
     element = self.WaitUntil(self.GetVisibleElement, target)
     element.click()
+
+  @SeleniumAction
+  def DoubleClick(self, target):
+    # Selenium clicks elements by obtaining their position and then issuing a
+    # click action in the middle of this area. This may lead to misclicks when
+    # elements are moving. Make sure that they are stationary before issuing
+    # the click action (specifically, using the bootstrap "fade" class that
+    # slides dialogs in is highly discouraged in combination with
+    # .DoubleClick()).
+    self.WaitForAjaxCompleted()
+    element = self.WaitUntil(self.GetVisibleElement, target)
+    action_chains.ActionChains(self.driver).double_click(element).perform()
 
   def ClickUntilNotVisible(self, target):
     self.WaitUntil(self.GetVisibleElement, target)
@@ -1316,6 +1388,9 @@ class ActionMock(object):
          if k in action_names])
     self.action_counts = dict((x, 0) for x in action_names)
 
+  def RecordCall(self, action_name, action_args):
+    pass
+
   def HandleMessage(self, message):
     message.auth_state = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
     client_worker = FakeClientWorker()
@@ -1324,11 +1399,22 @@ class ActionMock(object):
     if hasattr(self, message.name):
       return getattr(self, message.name)(message.payload)
 
+    self.RecordCall(message.name, message.payload)
     action_cls = self.action_classes[message.name]
     action = action_cls(message=message, grr_worker=client_worker)
     action.Execute()
     self.action_counts[message.name] += 1
     return client_worker.responses
+
+
+class RecordingActionMock(ActionMock):
+
+  def __init__(self, *action_names):
+    super(RecordingActionMock, self).__init__(*action_names)
+    self.recorded_args = {}
+
+  def RecordCall(self, action_name, action_args):
+    self.recorded_args.setdefault(action_name, []).append(action_args)
 
 
 class InvalidActionMock(object):
@@ -1658,7 +1744,28 @@ class ClientFixture(object):
           else:
             rdfvalue_object = attribute(value)
 
-          aff4_object.AddAttribute(attribute, rdfvalue_object)
+          # If we don't already have a pathspec, try and get one from the stat.
+          if aff4_object.Get(aff4_object.Schema.PATHSPEC) is None:
+            # If the attribute was a stat, it has a pathspec nested in it.
+            # We should add that pathspec as an attribute.
+            if attribute.attribute_type == rdfvalue.StatEntry:
+              stat_object = attribute.attribute_type.FromTextFormat(
+                  utils.SmartStr(value))
+              if stat_object.pathspec:
+                pathspec_attribute = aff4.Attribute(
+                    "aff4:pathspec", rdfvalue.PathSpec,
+                    "The pathspec used to retrieve "
+                    "this object from the client.",
+                    "pathspec")
+                aff4_object.AddAttribute(pathspec_attribute,
+                                         stat_object.pathspec)
+
+          if attribute in ["aff4:content", "aff4:content"]:
+            # For AFF4MemoryStreams we need to call Write() instead of
+            # directly setting the contents..
+            aff4_object.Write(rdfvalue_object)
+          else:
+            aff4_object.AddAttribute(attribute, rdfvalue_object)
 
         # Make sure we do not actually close the object here - we only want to
         # sync back its attributes, not run any finalization code.
@@ -1824,6 +1931,23 @@ class ClientFullVFSFixture(ClientVFSHandlerFixture):
   """Full client VFS mock."""
   prefix = "/"
   supported_pathtype = rdfvalue.PathSpec.PathType.OS
+
+
+class ClientTestDataVFSFixture(ClientVFSHandlerFixture):
+  """Client VFS mock that looks for files in the test_data directory."""
+  prefix = "/fs/os"
+  supported_pathtype = rdfvalue.PathSpec.PathType.OS
+
+  def Read(self, length):
+    test_data_path = os.path.join(config_lib.CONFIG["Test.data_dir"],
+                                  os.path.basename(self.path))
+    if not os.path.exists(test_data_path):
+      raise IOError("Could not find %s" % test_data_path)
+
+    data = open(test_data_path, "r").read()[self.offset:self.offset + length]
+
+    self.offset += len(data)
+    return data
 
 
 class GrrTestProgram(unittest.TestProgram):

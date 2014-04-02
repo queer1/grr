@@ -16,7 +16,27 @@ class FetchFilesArgs(rdfvalue.RDFProtoStruct):
 
 
 class FetchFiles(flow.GRRFlow):
-  """This flow globs for files, computes their hashes, and fetches 'new' files.
+  """This flow downloads files from clients based on a file path glob.
+
+  DEPRECATED.
+  This flow is now deprecated in favor of FileFinder. To use FileFinder instead
+  of FetchFiles:
+  Specify list of glob expressions corresponding to the files you
+  want to fetch. Set "action" to "Download". If needed, specify one or more
+  conditions. Only files matching these conditions will be downloaded.
+  ------------------------------------------------------------------------------
+
+  This glob will download any files under the environment directory with
+  the basename "notepad" and any extension:
+
+  %%KnowledgeBase.environ_windir%%/**notepad.*
+
+  The default ** recursion depth is 3 levels, and can be modified using a number
+  after the ** like this:
+
+  %%KnowledgeBase.environ_windir%%/**10notepad.*
+
+  Files are de-duplicated to save client side bandwidth.
 
   The result from this flow is a population of aff4 objects under
   aff4:/filestore/hash/(generic|pecoff)/<hashname>/<hashvalue>.
@@ -26,7 +46,7 @@ class FetchFiles(flow.GRRFlow):
   friendly_name = "Fetch Files"
   category = "/Filesystem/"
   args_type = FetchFilesArgs
-  behaviours = flow.GRRFlow.behaviours + "BASIC"
+  behaviours = flow.GRRFlow.behaviours + "ADVANCED"
 
   @classmethod
   def GetDefaultArgs(cls, token=None):
@@ -45,6 +65,7 @@ class FetchFiles(flow.GRRFlow):
 
     if self.args.paths:
       self.CallFlow("Glob", next_state="ProcessGlob", paths=self.args.paths,
+                    root_path=self.args.root_path,
                     pathtype=self.args.pathtype)
 
   @flow.StateHandler(next_state=["ProcessGlob", "Done"])

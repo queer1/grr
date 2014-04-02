@@ -107,7 +107,12 @@ class WinUserSids(parsers.RegistryParser):
       kb_user = rdfvalue.KnowledgeBaseUser()
       kb_user.sid = sid_str
       if stat.pathspec.Basename() == "ProfileImagePath":
-        kb_user.homedir = stat.registry_data.GetValue()
+        if stat.resident:
+          # Support old clients.
+          kb_user.homedir = utils.SmartUnicode(stat.resident)
+        else:
+          kb_user.homedir = stat.registry_data.GetValue()
+
         kb_user.userprofile = kb_user.homedir
         try:
           # Assume username is the last component of the path. This is not
@@ -149,6 +154,9 @@ class WinUserSpecialDirs(parsers.RegistryParser):
       "Environment": {
           "TEMP": "temp",
           },
+      "Volatile Environment": {
+          "USERDOMAIN": "userdomain",
+          },
   }
 
   def ParseMultiple(self, stats, knowledge_base):
@@ -187,7 +195,7 @@ class WinServicesParser(parsers.RegistryValueParser):
     http://support.microsoft.com/kb/103000
   """
 
-  output_types = ["ServiceInformation"]
+  output_types = ["WindowsServiceInformation"]
   supported_artifacts = ["WindowsServices"]
   process_together = True
 
@@ -203,7 +211,7 @@ class WinServicesParser(parsers.RegistryValueParser):
     return self.service_re.match(path).group(3)
 
   def ParseMultiple(self, stats, knowledge_base):
-    """Parse Service registry keys and return ServiceInformation objects."""
+    """Parse Service registry keys and return WindowsServiceInformation."""
     _ = knowledge_base
     services = {}
     field_map = {"Description": "description",
@@ -225,9 +233,9 @@ class WinServicesParser(parsers.RegistryValueParser):
 
       service_name = self._GetServiceName(stat.pathspec.path)
       reg_key = stat.aff4path.Dirname()
-      services.setdefault(service_name,
-                          rdfvalue.ServiceInformation(name=service_name,
-                                                      registry_key=reg_key))
+      service_info = rdfvalue.WindowsServiceInformation(name=service_name,
+                                                        registry_key=reg_key)
+      services.setdefault(service_name, service_info)
 
       key = self._GetKeyName(stat.pathspec.path)
 

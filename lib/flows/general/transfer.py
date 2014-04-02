@@ -19,7 +19,14 @@ class GetFileArgs(rdfvalue.RDFProtoStruct):
 
 
 class GetFile(flow.GRRFlow):
-  """An efficient file transfer mechanism.
+  """An efficient file transfer mechanism (deprecated, use MultiGetFile).
+
+  This flow is deprecated in favor of MultiGetFile, but kept for now for use by
+  MemoryCollector since the buffer hashing performed by MultiGetFile is
+  pointless for memory acquisition.
+
+  GetFile can also retrieve content from device files that report a size of 0 in
+  stat when read_length is specified.
 
   Returns to parent flow:
     An PathSpec.
@@ -158,6 +165,7 @@ class GetFile(flow.GRRFlow):
       stat_response = self.state.fd.Get(self.state.fd.Schema.STAT)
 
       fd.size = min(fd.size, self.state.file_size)
+      fd.Set(fd.Schema.CONTENT_LAST, rdfvalue.RDFDatetime().Now())
       fd.Close(sync=True)
 
       # Notify any parent flows the file is ready to be used now.
@@ -165,6 +173,7 @@ class GetFile(flow.GRRFlow):
 
 
 class HashTracker(object):
+
   def __init__(self, hash_response, is_known=False):
     self.hash_response = hash_response
     self.is_known = is_known
@@ -210,6 +219,7 @@ class FileTracker(object):
     self.fd.Set(self.fd.Schema.STAT(self.stat_entry))
     self.fd.Set(self.fd.Schema.SIZE(self.stat_entry.st_size))
     self.fd.Set(self.fd.Schema.PATHSPEC(self.pathspec))
+    self.fd.Set(self.fd.Schema.CONTENT_LAST(rdfvalue.RDFDatetime().Now()))
     return self.fd
 
 
@@ -252,19 +262,25 @@ class MultiGetFile(flow.GRRFlow):
                            token=self.token)
     self.state.Register("filestore", fd)
 
+    unique_paths = set()
     for pathspec in self.args.pathspecs:
 
       vfs_urn = aff4.AFF4Object.VFSGRRClient.PathspecToURN(
           pathspec, self.client_id)
 
-      # If we have duplicate pathspecs only stat/hash once.
-      if vfs_urn not in self.state.pending_hashes:
-        self.CallClient("StatFile", pathspec=pathspec,
-                        next_state="StoreStat",
-                        request_data=dict(vfs_urn=vfs_urn))
-        self.CallClient("HashFile", pathspec=pathspec,
-                        next_state="ReceiveFileHash",
-                        request_data=dict(vfs_urn=vfs_urn))
+      if vfs_urn not in unique_paths:
+        # Only Stat/Hash each path once, input pathspecs can have dups.
+        unique_paths.add(vfs_urn)
+
+        self.StartFile(pathspec, vfs_urn)
+
+  def StartFile(self, pathspec, vfs_urn):
+    self.CallClient("StatFile", pathspec=pathspec,
+                    next_state="StoreStat",
+                    request_data=dict(vfs_urn=vfs_urn))
+    self.CallClient("HashFile", pathspec=pathspec,
+                    next_state="ReceiveFileHash",
+                    request_data=dict(vfs_urn=vfs_urn))
 
   @flow.StateHandler()
   def StoreStat(self, responses):
@@ -408,6 +424,12 @@ class MultiGetFile(flow.GRRFlow):
   def CheckHash(self, responses):
     """Adds the block hash to the file tracker responsible for this vfs URN."""
     vfs_urn = responses.request_data["urn"]
+
+    if vfs_urn not in self.state.pending_files:
+      # This is a blobhash for a file we already failed to read and logged as
+      # below, check here to avoid logging dups.
+      return
+
     file_tracker = self.state.pending_files[vfs_urn]
 
     hash_response = responses.First()
@@ -634,8 +656,8 @@ class TransferStore(flow.WellKnownFlow):
       fd.Set(fd.Schema.SIZE(len(data)))
       super(aff4.AFF4MemoryStream, fd).Close(sync=True)
 
-      logging.info("Got blob %s (length %s)", digest.encode("hex"),
-                   len(cdata))
+      logging.debug("Got blob %s (length %s)", digest.encode("hex"),
+                    len(cdata))
 
 
 class SendFile(flow.GRRFlow):

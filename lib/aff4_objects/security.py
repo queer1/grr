@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
 """AFF4 Objects to enforce ACL policies."""
 
 import urllib
@@ -50,7 +49,7 @@ class Approval(aff4.AFF4Object):
     raise NotImplementedError()
 
   @staticmethod
-  def GetApprovalForObject(object_urn, token, username=""):
+  def GetApprovalForObject(object_urn, token=None, username=""):
     """Looks for approvals for an object and returns available valid tokens.
 
     Args:
@@ -65,9 +64,13 @@ class Approval(aff4.AFF4Object):
       A token for access to the object on success, otherwise raises.
 
     Raises:
-      UnauthorizedAccess: If there are no valid tokens available.
+      UnauthorizedAccess: If there are no valid approvals available.
 
     """
+    if token is None:
+      raise access_control.UnauthorizedAccess(
+          "No token given, cannot authenticate.")
+
     if not username:
       username = token.username
     approval_urn = aff4.ROOT_URN.Add("ACL").Add(object_urn.Path()).Add(
@@ -195,9 +198,12 @@ class ApprovalWithApproversAndReason(Approval):
       # We need to check labels with high privilege since normal users can
       # inspect other user's labels.
       for approver in approvers:
-        if data_store.DB.security_manager.CheckUserLabels(
-            approver, [self.checked_approvers_label], token=token.SetUID()):
+        try:
+          data_store.DB.security_manager.CheckUserLabels(
+              approver, [self.checked_approvers_label], token=token.SetUID())
           approvers_with_label.append(approver)
+        except access_control.UnauthorizedAccess:
+          pass
 
       if len(approvers_with_label) < self.min_approvers_with_label:
         raise access_control.UnauthorizedAccess(
@@ -312,6 +318,12 @@ class RequestApprovalWithReasonFlow(flow.GRRFlow):
     """Returns the string with subject's title."""
     raise NotImplementedError()
 
+  @classmethod
+  def ApprovalUrnBuilder(cls, subject, user, reason):
+    """Encode an approval URN."""
+    return aff4.ROOT_URN.Add("ACL").Add(
+        subject).Add(user).Add(utils.EncodeReasonString(reason))
+
   @flow.StateHandler()
   def Start(self):
     """Create the Approval object and notify the Approval Granter."""
@@ -350,8 +362,12 @@ Please click <a href='%(admin_ui)s#%(approval_urn)s'>
 </a> to review this request and then grant access.
 
 <p>Thanks,</p>
-<p>The GRR team.
+<p>The GRR team.</p>
+<p>%(image)s</p>
 </body></html>"""
+
+      # If you feel like it, add a funny cat picture here :)
+      image = ""
 
       url = urllib.urlencode((("acl", utils.SmartStr(approval_urn)),
                               ("main", "GrantAccess")))
@@ -363,7 +379,8 @@ Please click <a href='%(admin_ui)s#%(approval_urn)s'>
                                  reason=utils.SmartStr(self.args.reason),
                                  admin_ui=config_lib.CONFIG["AdminUI.url"],
                                  subject_title=subject_title,
-                                 approval_urn=url),
+                                 approval_urn=url,
+                                 image=image),
                              is_html=True)
 
 
@@ -386,6 +403,12 @@ class GrantApprovalWithReasonFlow(flow.GRRFlow):
   def BuildAccessUrl(self):
     """Builds the urn to access this object."""
     raise NotImplementedError()
+
+  @classmethod
+  def ApprovalUrnBuilder(cls, subject, user, reason):
+    """Encode an approval URN."""
+    return RequestApprovalWithReasonFlow.ApprovalUrnBuilder(subject, user,
+                                                            reason)
 
   @flow.StateHandler()
   def Start(self):
@@ -510,8 +533,14 @@ class RequestClientApprovalFlow(RequestApprovalWithReasonFlow):
 
   def BuildApprovalUrn(self):
     """Builds approval object urn."""
-    return aff4.ROOT_URN.Add("ACL").Add(self.client_id.Path()).Add(
-        self.token.username).Add(utils.EncodeReasonString(self.args.reason))
+    event = rdfvalue.AuditEvent(user=self.token.username,
+                                action="CLIENT_APPROVAL_REQUEST",
+                                client=self.client_id,
+                                description=self.args.reason)
+    flow.Events.PublishEvent("Audit", event, token=self.token)
+
+    return self.ApprovalUrnBuilder(self.client_id.Path(), self.token.username,
+                                   self.args.reason)
 
   def BuildSubjectTitle(self):
     """Returns the string with subject's title."""
@@ -529,8 +558,15 @@ class GrantClientApprovalFlow(GrantApprovalWithReasonFlow):
 
   def BuildApprovalUrn(self):
     """Builds approval object urn."""
-    return aff4.ROOT_URN.Add("ACL").Add(self.client_id.Path()).Add(
-        self.args.delegate).Add(utils.EncodeReasonString(self.args.reason))
+    flow.Events.PublishEvent("Audit",
+                             rdfvalue.AuditEvent(user=self.token.username,
+                                                 action="CLIENT_APPROVAL_GRANT",
+                                                 client=self.client_id,
+                                                 description=self.args.reason),
+                             token=self.token)
+
+    return self.ApprovalUrnBuilder(self.client_id.Path(), self.args.delegate,
+                                   self.args.reason)
 
   def BuildAccessUrl(self):
     """Builds the urn to access this object."""
@@ -553,8 +589,14 @@ class BreakGlassGrantClientApprovalFlow(BreakGlassGrantApprovalWithReasonFlow):
 
   def BuildApprovalUrn(self):
     """Builds approval object urn."""
-    return aff4.ROOT_URN.Add("ACL").Add(self.client_id.Path()).Add(
-        self.token.username).Add(utils.EncodeReasonString(self.args.reason))
+    event = rdfvalue.AuditEvent(user=self.token.username,
+                                action="CLIENT_APPROVAL_BREAK_GLASS_REQUEST",
+                                client=self.client_id,
+                                description=self.args.reason)
+    flow.Events.PublishEvent("Audit", event, token=self.token)
+
+    return self.ApprovalUrnBuilder(self.client_id.Path(), self.token.username,
+                                   self.args.reason)
 
   def BuildSubjectTitle(self):
     """Returns the string with subject's title."""
@@ -573,9 +615,15 @@ class RequestHuntApprovalFlow(RequestApprovalWithReasonFlow):
   def BuildApprovalUrn(self):
     """Builds approval object URN."""
     # In this case subject_urn is hunt's URN.
-    return aff4.ROOT_URN.Add("ACL").Add(
-        self.args.subject_urn.Path()).Add(self.token.username).Add(
-            utils.EncodeReasonString(self.args.reason))
+    flow.Events.PublishEvent("Audit",
+                             rdfvalue.AuditEvent(user=self.token.username,
+                                                 action="HUNT_APPROVAL_REQUEST",
+                                                 urn=self.args.subject_urn,
+                                                 description=self.args.reason),
+                             token=self.token)
+
+    return self.ApprovalUrnBuilder(self.args.subject_urn.Path(),
+                                   self.token.username, self.args.reason)
 
   def BuildSubjectTitle(self):
     """Returns the string with subject's title."""
@@ -592,9 +640,15 @@ class GrantHuntApprovalFlow(GrantApprovalWithReasonFlow):
   def BuildApprovalUrn(self):
     """Builds approval object URN."""
     # In this case subject_urn is hunt's URN.
-    return aff4.ROOT_URN.Add("ACL").Add(
-        self.args.subject_urn.Path()).Add(self.args.delegate).Add(
-            utils.EncodeReasonString(self.args.reason))
+    flow.Events.PublishEvent("Audit",
+                             rdfvalue.AuditEvent(user=self.token.username,
+                                                 action="HUNT_APPROVAL_GRANT",
+                                                 urn=self.args.subject_urn,
+                                                 description=self.args.reason),
+                             token=self.token)
+
+    return self.ApprovalUrnBuilder(self.args.subject_urn.Path(),
+                                   self.args.delegate, self.args.reason)
 
   def BuildSubjectTitle(self):
     """Returns the string with subject's title."""
@@ -616,9 +670,15 @@ class RequestCronJobApprovalFlow(RequestApprovalWithReasonFlow):
   def BuildApprovalUrn(self):
     """Builds approval object URN."""
     # In this case subject_urn is hunt's URN.
-    return aff4.ROOT_URN.Add("ACL").Add(
-        self.args.subject_urn.Path()).Add(self.token.username).Add(
-            utils.EncodeReasonString(self.args.reason))
+    flow.Events.PublishEvent("Audit",
+                             rdfvalue.AuditEvent(user=self.token.username,
+                                                 action="CRON_APPROVAL_REQUEST",
+                                                 urn=self.args.subject_urn,
+                                                 description=self.args.reason),
+                             token=self.token)
+
+    return self.ApprovalUrnBuilder(self.args.subject_urn.Path(),
+                                   self.token.username, self.args.reason)
 
   def BuildSubjectTitle(self):
     """Returns the string with subject's title."""
@@ -635,9 +695,15 @@ class GrantCronJobApprovalFlow(GrantApprovalWithReasonFlow):
   def BuildApprovalUrn(self):
     """Builds approval object URN."""
     # In this case subject_urn is hunt's URN.
-    return aff4.ROOT_URN.Add("ACL").Add(
-        self.args.subject_urn.Path()).Add(self.args.delegate).Add(
-            utils.EncodeReasonString(self.args.reason))
+    flow.Events.PublishEvent("Audit",
+                             rdfvalue.AuditEvent(user=self.token.username,
+                                                 action="CRON_APPROVAL_GRANT",
+                                                 urn=self.args.subject_urn,
+                                                 description=self.args.reason),
+                             token=self.token)
+
+    return self.ApprovalUrnBuilder(self.args.subject_urn.Path(),
+                                   self.args.delegate, self.args.reason)
 
   def BuildSubjectTitle(self):
     """Returns the string with subject's title."""

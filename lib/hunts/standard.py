@@ -145,6 +145,23 @@ class ModifyHuntFlow(flow.GRRFlow):
         if runner.IsHuntStarted():
           raise RuntimeError("Unable to modify a running hunt. Pause it first.")
 
+        # Record changes in the audit event
+        changes = []
+        if runner.context.expires != self.args.expiry_time:
+          changes.append("Expires: Old=%s, New=%s" % (runner.context.expires,
+                                                      self.args.expiry_time))
+
+        if runner.args.client_limit != self.args.client_limit:
+          changes.append("Client Limit: Old=%s, New=%s" % (
+              runner.args.client_limit, self.args.client_limit))
+
+        description = ", ".join(changes)
+        event = rdfvalue.AuditEvent(user=self.token.username,
+                                    action="HUNT_MODIFIED",
+                                    urn=self.args.hunt_urn,
+                                    description=description)
+        flow.Events.PublishEvent("Audit", event, token=self.token)
+
         # Just go ahead and change the hunt now.
         runner.context.expires = self.args.expiry_time
         runner.args.client_limit = self.args.client_limit
@@ -255,7 +272,7 @@ class RegistryFileHunt(implementation.GRRHunt):
       self.CallFlow("GetFile", pathspec=pathspec, next_state="StoreResults",
                     client_id=client_id)
 
-    client = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id), mode="r",
+    client = aff4.FACTORY.Open(rdfvalue.ClientURN(client_id), mode="r",
                                token=self.token)
     users = client.Get(client.Schema.USER) or []
     for user in users:
@@ -298,7 +315,7 @@ class ProcessesHunt(implementation.GRRHunt):
     client_id = responses.request.client_id
     if responses.success:
       self.LogResult(client_id, "Got process listing.",
-                     aff4.ROOT_URN.Add(client_id).Add("processes"))
+                     rdfvalue.ClientURN(client_id).Add("processes"))
     else:
       self.LogClientError(client_id, log_message=responses.status)
 
@@ -519,7 +536,7 @@ class RunKeysHunt(implementation.GRRHunt):
     client_id = responses.request.client_id
     if responses.success:
       self.LogResult(client_id, "Downloaded RunKeys",
-                     aff4.ROOT_URN.Add(client_id).Add("analysis/RunKeys"))
+                     rdfvalue.ClientURN(client_id).Add("analysis/RunKeys"))
     else:
       self.LogClientError(client_id, log_message=utils.SmartStr(
           responses.status))
@@ -604,7 +621,7 @@ class HuntResultsMetadata(aff4.AFF4Object):
 
     OUTPUT_PLUGINS = aff4.Attribute(
         "aff4:output_plugins_state", rdfvalue.FlowState,
-        "Piclked output plugins.", versioned=False)
+        "Pickled output plugins.", versioned=False)
 
 
 class ProcessHuntResultsCronFlowArgs(rdfvalue.RDFProtoStruct):
@@ -660,8 +677,8 @@ class ProcessHuntResultsCronFlow(cronjobs.SystemCronFlow):
         num_processed += len(batch)
 
         for plugin_name, plugin in used_plugins.iteritems():
-          logging.info("Processing hunt %s with %s, batch %d", session_id,
-                       plugin_name, batch_index)
+          logging.debug("Processing hunt %s with %s, batch %d", session_id,
+                        plugin_name, batch_index)
 
           try:
             plugin.ProcessResponses(batch)
@@ -715,6 +732,8 @@ class ProcessHuntResultsCronFlow(cronjobs.SystemCronFlow):
         self.HeartBeat()
 
       except Exception as e:  # pylint: disable=broad-except
+        logging.exception("Error processing hunt %s.", session_id)
+        self.Log("Error processing hunt %s: %s", session_id, e)
         last_exception = e
 
       # We will delete hunt's results notification even if ProcessHunt has
@@ -732,8 +751,8 @@ class ProcessHuntResultsCronFlow(cronjobs.SystemCronFlow):
         # We don't want to delete notification that was written after we
         # started processing.
         if latest_timestamp and latest_timestamp > timestamp:
-          logging.info("Not deleting results notification: it was written "
-                       "after processing has started.")
+          logging.debug("Not deleting results notification: it was written "
+                        "after processing has started.")
         else:
           data_store.DB.DeleteAttributes(GenericHunt.RESULTS_QUEUE,
                                          [session_id], sync=True,
@@ -804,8 +823,12 @@ class GenericHunt(implementation.GRRHunt):
 
     self.SetDescription()
 
-  def SetDescription(self):
-    self.state.context.description = self.state.args.flow_runner_args.flow_name
+  def SetDescription(self, description=None):
+    if description:
+      self.state.context.args.description = description
+    else:
+      flow_name = self.state.args.flow_runner_args.flow_name
+      self.state.context.args.description = flow_name
 
   @flow.StateHandler(next_state=["MarkDone"])
   def RunClient(self, responses):
@@ -871,7 +894,7 @@ class GenericHunt(implementation.GRRHunt):
     self.state.context.usage_stats.RegisterResources(resources)
 
     if responses.success:
-      msg = "Flow %s completed." % self.state.context.description,
+      msg = "Flow %s completed." % self.state.context.args.description,
       self.LogResult(client_id, msg)
 
       with self.lock:
@@ -910,8 +933,8 @@ class VariableGenericHunt(GenericHunt):
 
   args_type = VariableGenericHuntArgs
 
-  def SetDescription(self):
-    self.state.context.description = "Variable Generic Hunt"
+  def SetDescription(self, description=None):
+    self.state.context.args.description = description or "Variable Generic Hunt"
 
   @flow.StateHandler(next_state=["MarkDone"])
   def RunClient(self, responses):
@@ -924,16 +947,18 @@ class VariableGenericHunt(GenericHunt):
                 runner_args=flow_request.runner_args,
                 next_state="MarkDone", client_id=client_id)
 
-  def ManuallyScheduleClients(self):
+  def ManuallyScheduleClients(self, token=None):
     """Schedule all flows without using the Foreman.
 
     Since we know all the client ids to run on we might as well just schedule
     all the flows and wait for the results.
+
+    Args:
+      token: A datastore access token.
     """
     client_ids = set()
     for flow_request in self.state.args.flows:
       for client_id in flow_request.client_ids:
         client_ids.add(client_id)
 
-    for client_id in client_ids:
-      self.StartClient(self.session_id, client_id)
+    self.StartClients(self.session_id, client_ids, token=token)

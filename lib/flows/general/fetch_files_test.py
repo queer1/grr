@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- mode: python; encoding: utf-8 -*-
 
-# Copyright 2012 Google Inc. All Rights Reserved.
 """Tests for the FetchFiles flow."""
 
 
@@ -129,8 +128,8 @@ class TestFetchFilesFlow(test_lib.FlowTestsBaseclass):
 
         for _ in test_lib.TestFlowHelper(
             "FetchFiles", client_mock, token=self.token,
-            paths=[os.path.join(self.base_path, "winexec_img.dd", "*.exe"),
-                   os.path.join(self.base_path, "winexec_img.dd", "*.sys")],
+            paths=["*.exe", "*.sys"],
+            root_path=self.base_pathspec,
             pathtype=rdfvalue.PathSpec.PathType.OS,
             client_id=self.client_id):
           pass

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Configuration parameters for server side subsystems."""
+"""Configuration parameters for the server side subsystems."""
 
 from grr.lib import config_lib
 from grr.lib import rdfvalue
@@ -16,6 +16,11 @@ config_lib.DEFINE_integer("Worker.task_limit", 2000,
 config_lib.DEFINE_integer("Worker.flow_lease_time", 600,
                           "Duration of flow lease time in seconds.")
 
+config_lib.DEFINE_integer("Worker.worker_process_count", 1,
+                          "Number of worker processes to run. Each worker can "
+                          "only use a single CPU, so scaling this up on "
+                          "multiprocessor systems may make sense.")
+
 config_lib.DEFINE_integer("Frontend.throttle_average_interval", 60,
                           "Time interval over which average request rate is "
                           "calculated when throttling is enabled.")
@@ -30,7 +35,6 @@ config_lib.DEFINE_string("Worker.smtp_server", "localhost",
                          "The smpt server for sending email alerts.")
 
 config_lib.DEFINE_integer("Worker.smtp_port", 25, "The smtp server port.")
-
 
 # Server Cryptographic settings.
 config_lib.DEFINE_semantic(
@@ -67,7 +71,12 @@ config_lib.DEFINE_integer("Mongo.port", 27017, "The mongo server port..")
 
 config_lib.DEFINE_string("Mongo.db_name", "grr", "The mongo database name")
 
-# Mysql data store.
+# MySQL data store.
+config_lib.DEFINE_string("Mysql.host", "localhost",
+                         "The MySQL server hostname.")
+
+config_lib.DEFINE_integer("Mysql.port", 0, "The MySQL server port.")
+
 config_lib.DEFINE_string("Mysql.database_name", default="grr",
                          help="Name of the database to use.")
 
@@ -142,3 +151,7 @@ config_lib.DEFINE_string(
     "AdminUI.ssl_key_file", None,
     "The SSL key to use. The key may also be part of the cert file, in which "
     "case this can be omitted.")
+
+
+config_lib.DEFINE_string("Server.master_watcher_class", "DefaultMasterWatcher",
+                         "The master watcher class to use.")

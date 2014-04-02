@@ -104,20 +104,29 @@ grr.init = function() {
    * basically patches the jQuery.ajax method to remove the XSSI preamble.
    */
   if (grr.installXssiProtection) {
+    var json_converter = function(data) {
+      if (typeof data !== 'string' || !data) {
+        return null;
+      }
+
+      if (data.substring(0, 4) != ')]}\n') {
+        return jQuery.error('JSON object not properly protected.');
+      }
+
+      return $.parseJSON(data.substring(4, data.length));
+    };
+
+    var test = function(data) {
+      return window.String(data);
+    };
+
     $.ajaxSetup({
       crossDomain: false,
-      converters:
-        { 'text json': function(data) {
-          if (typeof data !== 'string' || !data) {
-            return null;
-          }
-
-          if (data.substring(0, 4) != ')]}\n') {
-            return jQuery.error('JSON object not properly protected.');
-          }
-
-          return $.parseJSON(data.substring(4, data.length));
-        }
+      converters: {
+        '* application': window.String,
+        'application json': json_converter,
+        'application javascript': json_converter,
+        'text json': json_converter
       }
     });
     grr.installXssiProtection = false;
@@ -156,15 +165,16 @@ grr.init = function() {
  *
  * @param {string} renderer The name of the RenderTree responsible for this
  *     tree.
- * @param {string} domId The domId of the div element that will contain the
+ * @param {string} unique_id The id of the div element that will contain the
  *     tree.
  * @param {string=} opt_publishEvent The name of the GRR event queue where
  *     select events will be published. DEFAULT: "tree_select".
  * @param {Object=} opt_state An optional state object to pass to the
  *     server. DEFAULT: global state.
  * @param {Function=} opt_success_cb an optional function to handle ajax stream.
+ * @return {Object=} jQuery-wrapped tree.
  */
-grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
+grr.grrTree = function(renderer, unique_id, opt_publishEvent, opt_state,
                        opt_success_cb) {
   var state = $.extend({}, grr.state, opt_state);
   var publishEvent = opt_publishEvent || 'tree_select';
@@ -173,14 +183,8 @@ grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
   state.reason = state.reason || grr.state.reason;
   state.client_id = state.client_id || grr.state.client_id;
 
-  /* Build the tree navigator */
-  var container = $('#' + domId);
-  var unique_id = (new Date()).getTime();
-
-  /* We attach the tree to a unique dom node so that when the tree is removed,
-   * subscribed events will also disappear. */
-  container.append("<div class='grr_default' id='" + unique_id + "'></div>");
   var tree = $('#' + unique_id);
+  tree.html('');
 
   tree.jstree({
     'json_data' : {
@@ -258,13 +262,13 @@ grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
   });
 
   grr.subscribe('client_selection', function(message) {
-    // Kill the tree
-    container.html('');
     // Make a new one
-    grr.grrTree(renderer, domId, opt_publishEvent, opt_state,
-      opt_success_cb);
+    grr.grrTree(renderer, unique_id, opt_publishEvent, opt_state,
+                opt_success_cb);
     grr.publish(publishEvent, '/');
   }, unique_id);
+
+  return tree;
 };
 
 
@@ -522,7 +526,9 @@ grr.table.scrollHandler = function(renderer, tbody, opt_state) {
 
   $('.table_loading', tbody).each(function() {
     loading_offset = $(this).offset();
-    elem = document.elementFromPoint(loading_offset.left, loading_offset.top);
+    elem = document.elementFromPoint(
+        loading_offset.left - $(window).scrollLeft(),
+        loading_offset.top - $(window).scrollTop());
     if ($(elem).hasClass('table_loading')) {
       // Prevent scrollHandler from being called again for this "Loading..."
       // row.
@@ -616,7 +622,7 @@ grr.table.toggleChildRows = function(node, data) {
     item.removeClass('tree_opened');
   } else {
     var tbody = item.parents('table').find('tbody');
-    var dom = $("<td id='" + tbody.attr('id') +
+    var dom = $("<td id='" + tbody.attr('id') + '_loading' +
         "' class='table_loading' colspan=200>Loading ...</td>");
     dom.attr('data', data);
     dom.attr('depth', depth + 1);
@@ -644,8 +650,7 @@ grr.table.toggleChildRows = function(node, data) {
 grr.table.newTable = function(renderer, domId, unique, opt_state) {
   var me = $('#' + domId);
 
-  // Click handler.
-  $('#' + unique).click(function(event) {
+  var rowHandler = function(event) {
     /* Find the next TR above the clicked point */
     var node = $(event.target).closest('tr');
     var row_id = node.attr('row_id');
@@ -658,10 +663,14 @@ grr.table.newTable = function(renderer, domId, unique, opt_state) {
       node.addClass('row_selected');
 
       // Publish the selected node
-      grr.publish('select_' + domId, node);
+      grr.publish(event.data, node);
     }
     event.stopPropagation();
-  });
+  };
+
+  // Click handler.
+  $('#' + unique).click('select_' + domId, rowHandler);
+  $('#' + unique).dblclick('double_click_' + domId, rowHandler);
 
   $('#' + unique).on('refresh', function() {
     var selected_row = $('tr.row_selected', me).first();
@@ -755,7 +764,6 @@ grr.poll = function(renderer, domId, callback, timeout, state, opt_datatype,
 
   // First one to kick off
   update();
-  window.setTimeout(update, timeout);
 };
 
 /**
@@ -862,6 +870,7 @@ grr.update = function(renderer, domId, opt_state, on_success, inflight_key,
   if (!on_success) {
     on_success = function(data) {
       $('#' + domId).html(data);
+      grr.publish('on_renderer_load', domId);
     };
   }
 
@@ -884,6 +893,7 @@ grr.update = function(renderer, domId, opt_state, on_success, inflight_key,
 grr.layout = function(renderer, domId, opt_state, on_success) {
   success_handler = function(data) {
     $('#' + domId).html(data);
+    grr.publish('on_renderer_load', domId);
     if (on_success) {
       on_success(domId);
     }
@@ -1092,7 +1102,7 @@ grr.hexview = {};
  *
  */
 grr.hexview.BuildTable = function(domId, width, height) {
-  var table = $($('#HexTableTemplate').text());
+  var table = $($('#HexTableTemplate').html());
 
   // Insert the offset headers
   var layout = '';
@@ -1621,6 +1631,19 @@ grr.enableSearchHelp = function(clickNode) {
 
 };
 
+/**
+ * Pushes the state from the Javascript state dict to html tags.
+ * @param {string} domId of the widget which will receive the state.
+ * @param {Object} state The state to push.
+ */
+grr.pushState = function(domId, state) {
+  keys = Object.keys(state);
+  attrs = {};
+  for (var i = 0; i < keys.length; i++) {
+    attrs['state-' + keys[i]] = state[keys[i]];
+  }
+  $('#' + domId).attr(attrs);
+};
 
 /** Initialize the grr object */
 grr.init();

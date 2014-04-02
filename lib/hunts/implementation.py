@@ -157,6 +157,7 @@ class HuntRunner(flow_runner.FlowRunner):
         network_bytes_sent=0,
         next_outbound_id=1,
         next_processed_request=1,
+        next_states=set(),
         outstanding_requests=0,
         current_state=None,
         start_time=rdfvalue.RDFDatetime().Now(),
@@ -182,6 +183,18 @@ class HuntRunner(flow_runner.FlowRunner):
     """
     return rdfvalue.SessionID(base="aff4:/hunts", queue=self.args.queue)
 
+  def _CreateAuditEvent(self, event_action):
+    try:
+      flow_name = self.flow_obj.args.flow_runner_args.flow_name
+    except AttributeError:
+      flow_name = ""
+
+    event = rdfvalue.AuditEvent(user=self.flow_obj.token.username,
+                                action=event_action, urn=self.flow_obj.urn,
+                                flow_name=flow_name,
+                                description=self.args.description)
+    flow.Events.PublishEvent("Audit", event, token=self.flow_obj.token)
+
   def Start(self, add_foreman_rules=True):
     """This uploads the rules to the foreman and, thus, starts the hunt."""
     # We are already running.
@@ -203,6 +216,8 @@ class HuntRunner(flow_runner.FlowRunner):
     # recruitment rate according to the client_rate.
     self.context.Register("next_client_due",
                           rdfvalue.RDFDatetime().Now())
+
+    self._CreateAuditEvent("HUNT_STARTED")
 
     # Start the hunt.
     self.flow_obj.Set(self.flow_obj.Schema.STATE("STARTED"))
@@ -258,6 +273,8 @@ class HuntRunner(flow_runner.FlowRunner):
     self.flow_obj.Set(self.flow_obj.Schema.STATE("PAUSED"))
     self.flow_obj.Flush()
 
+    self._CreateAuditEvent("HUNT_PAUSED")
+
   def Stop(self):
     """Cancels the hunt (removes Foreman rules, resets expiry time to 0)."""
     # Make sure the user is allowed to stop this hunt.
@@ -270,6 +287,8 @@ class HuntRunner(flow_runner.FlowRunner):
 
     self.flow_obj.Set(self.flow_obj.Schema.STATE("STOPPED"))
     self.flow_obj.Flush()
+
+    self._CreateAuditEvent("HUNT_STOPPED")
 
   def IsRunning(self):
     """Hunts are always considered to be running.
@@ -463,7 +482,7 @@ class GRRHunt(flow.GRRFlow):
     if runner_args is None:
       runner_args = HuntRunnerArgs()
 
-    cls._FilterArgsFromSemanticProtobuf(runner_args, kwargs)
+    cls.FilterArgsFromSemanticProtobuf(runner_args, kwargs)
 
     # Is the required flow a known flow?
     if (runner_args.hunt_name not in cls.classes and
@@ -478,7 +497,7 @@ class GRRHunt(flow.GRRFlow):
     # kwargs..
     if hunt_obj.args_type and args is None:
       args = hunt_obj.args_type()
-      cls._FilterArgsFromSemanticProtobuf(args, kwargs)
+      cls.FilterArgsFromSemanticProtobuf(args, kwargs)
 
     if hunt_obj.args_type and not isinstance(args, hunt_obj.args_type):
       raise RuntimeError("Hunt args must be instance of %s" %
@@ -500,10 +519,21 @@ class GRRHunt(flow.GRRFlow):
 
     hunt_obj.Flush()
 
+    try:
+      flow_name = args.flow_runner_args.flow_name
+    except AttributeError:
+      flow_name = ""
+
+    event = rdfvalue.AuditEvent(user=runner_args.token.username,
+                                action="HUNT_CREATED", urn=hunt_obj.urn,
+                                flow_name=flow_name,
+                                description=runner_args.description)
+    flow.Events.PublishEvent("Audit", event, token=runner_args.token)
+
     return hunt_obj
 
   @classmethod
-  def StartClient(cls, hunt_id, client_id):
+  def StartClients(cls, hunt_id, client_ids, token=None):
     """This method is called by the foreman for each client it discovers.
 
     Note that this function is performance sensitive since it is called by the
@@ -511,34 +541,36 @@ class GRRHunt(flow.GRRFlow):
 
     Args:
       hunt_id: The hunt to schedule.
-      client_id: The client that should be added to the hunt.
+      client_ids: List of clients that should be added to the hunt.
+      token: An optional access token to use.
     """
-    token = access_control.ACLToken(username="Hunt", reason="hunting")
+    token = token or access_control.ACLToken(username="Hunt", reason="hunting")
 
-    # Now we construct a special response which will be sent to the hunt
-    # flow. Randomize the request_id so we do not overwrite other messages in
-    # the queue.
-    state = rdfvalue.RequestState(id=utils.PRNG.GetULong(),
-                                  session_id=hunt_id,
-                                  client_id=client_id,
-                                  next_state="AddClient")
-
-    # Queue the new request.
     with queue_manager.QueueManager(token=token) as flow_manager:
-      flow_manager.QueueRequest(hunt_id, state)
+      for client_id in client_ids:
+        # Now we construct a special response which will be sent to the hunt
+        # flow. Randomize the request_id so we do not overwrite other messages
+        # in the queue.
+        state = rdfvalue.RequestState(id=utils.PRNG.GetULong(),
+                                      session_id=hunt_id,
+                                      client_id=client_id,
+                                      next_state="AddClient")
 
-      # Send a response.
-      msg = rdfvalue.GrrMessage(
-          session_id=hunt_id,
-          request_id=state.id, response_id=1,
-          auth_state=rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED,
-          type=rdfvalue.GrrMessage.Type.STATUS,
-          payload=rdfvalue.GrrStatus())
+        # Queue the new request.
+        flow_manager.QueueRequest(hunt_id, state)
 
-      flow_manager.QueueResponse(hunt_id, msg)
+        # Send a response.
+        msg = rdfvalue.GrrMessage(
+            session_id=hunt_id,
+            request_id=state.id, response_id=1,
+            auth_state=rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED,
+            type=rdfvalue.GrrMessage.Type.STATUS,
+            payload=rdfvalue.GrrStatus())
 
-      # And notify the worker about it.
-      flow_manager.QueueNotification(hunt_id)
+        flow_manager.QueueResponse(hunt_id, msg)
+
+        # And notify the worker about it.
+        flow_manager.QueueNotification(hunt_id)
 
   def Run(self):
     """A shortcut method for starting the hunt."""

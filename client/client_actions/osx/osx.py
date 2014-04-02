@@ -211,20 +211,6 @@ class GetInstallDate(actions.ActionPlugin):
     self.SendReply(integer=0)
 
 
-class EnumerateUsers(actions.ActionPlugin):
-  """Enumerates all the users on this system."""
-  out_rdfvalue = rdfvalue.User
-
-  def Run(self, unused_args):
-    """Enumerate all users on this machine."""
-    # TODO(user): Add /var/run/utmpx parsing as per linux
-    blacklist = ["Shared"]
-    for user in os.listdir("/Users"):
-      userdir = "/Users/{0}".format(user)
-      if user not in blacklist and os.path.isdir(userdir):
-        self.SendReply(username=user, homedir=userdir)
-
-
 class EnumerateFilesystems(actions.ActionPlugin):
   """Enumerate all unique filesystems local to the system."""
   out_rdfvalue = rdfvalue.Filesystem
@@ -259,10 +245,10 @@ class EnumerateFilesystems(actions.ActionPlugin):
         continue
 
 
-class EnumerateRunningServices(actions.ActionPlugin):
+class OSXEnumerateRunningServices(actions.ActionPlugin):
   """Enumerate all running launchd jobs."""
   in_rdfvalue = None
-  out_rdfvalue = rdfvalue.Service
+  out_rdfvalue = rdfvalue.OSXServiceInformation
 
   def GetRunningLaunchDaemons(self):
     """Get running launchd jobs from objc ServiceManagement framework."""
@@ -295,37 +281,27 @@ class EnumerateRunningServices(actions.ActionPlugin):
     """Create the Service protobuf.
 
     Args:
-      job: Launcdjobdict from servicemanagement framework.
+      job: Launchdjobdict from servicemanagement framework.
     Returns:
-      sysinfo_pb2.Service proto
+      sysinfo_pb2.OSXServiceInformation proto
     """
-    rdf_job = rdfvalue.LaunchdJob(sessiontype=
-                                  job.get("LimitLoadToSessionType", ""),
-                                  lastexitstatus=job["LastExitStatus"].value,
-                                  timeout=job["TimeOut"].value,
-                                  ondemand=job["OnDemand"].value)
+    service = rdfvalue.OSXServiceInformation(
+        label=job.get("Label"), program=job.get("Program"),
+        sessiontype=job.get("LimitLoadToSessionType"),
+        lastexitstatus=int(job["LastExitStatus"]),
+        timeout=int(job["TimeOut"]), ondemand=bool(job["OnDemand"]))
 
-    # Returns CFArray of CFStrings
-    args = job.get("ProgramArguments", "", stringify=False)
-    arg_values = []
-    if args:
-      for arg in args:
-        # Need to get .value so unicode is handled properly
-        arg_values.append(arg.value)
-      args = " ".join(arg_values)
+    for arg in job.get("ProgramArguments", "", stringify=False):
+      # Returns CFArray of CFStrings
+      service.args.Append(unicode(arg))
 
     mach_dict = job.get("MachServices", {}, stringify=False)
     for key, value in mach_dict.iteritems():
-      rdf_job.machservice.Append("%s:%s" % (key, value))
+      service.machservice.Append("%s:%s" % (key, value))
 
     job_mach_dict = job.get("PerJobMachServices", {}, stringify=False)
     for key, value in job_mach_dict.iteritems():
-      rdf_job.perjobmachservice.Append("%s:%s" % (key, value))
-
-    service = rdfvalue.Service(label=job.get("Label", ""),
-                               program=job.get("Program", ""),
-                               args=args,
-                               osx_launchd=rdf_job)
+      service.perjobmachservice.Append("%s:%s" % (key, value))
 
     if "PID" in job:
       service.pid = job["PID"].value

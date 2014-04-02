@@ -31,6 +31,15 @@ class ClientURN(rdfvalue.RDFURN):
   # Valid client urns must match this expression.
   CLIENT_ID_RE = re.compile(r"^(aff4:/)?C\.[0-9a-fA-F]{16}$")
 
+  def __init__(self, initializer=None, age=None):
+    if isinstance(initializer, rdfvalue.RDFURN):
+      # pylint: disable=protected-access
+      if not self.Validate(initializer._string_urn):
+        raise type_info.TypeValueError(
+            "Client urn malformed: %s" % initializer)
+      # pylint: enable=protected-access
+    super(ClientURN, self).__init__(initializer=initializer, age=age)
+
   def ParseFromString(self, value):
     if not self.Validate(value):
       raise type_info.TypeValueError("Client urn malformed: %s" % value)
@@ -119,6 +128,8 @@ class User(rdfvalue.RDFProtoStruct):
       "domain": "userdomain",
       "homedir": "homedir",
       "sid": "sid",
+      "full_name": "full_name",
+      "last_logon": "last_logon",
       "special_folders.cookies": "cookies",
       "special_folders.local_settings": "local_settings",
       "special_folders.local_app_data": "localappdata",
@@ -139,8 +150,22 @@ class User(rdfvalue.RDFProtoStruct):
         val = getattr(getattr(self, attr), old_pb_name)
       else:
         val = getattr(self, old_pb_name)
-      kb_user.Set(new_pb_name, val)
+      if val:
+        kb_user.Set(new_pb_name, val)
     return kb_user
+
+  def FromKnowledgeBaseUser(self, kbuser):
+    """Convert a KnowledgeBaseUser into a User value."""
+    folders = rdfvalue.FolderInformation()
+    for old_pb_name, new_pb_name in self.kb_user_mapping.items():
+      val = getattr(kbuser, new_pb_name)
+      if val:
+        if len(old_pb_name.split(".")) > 1:
+          folders.Set(old_pb_name.split(".")[1], val)
+        else:
+          self.Set(old_pb_name, val)
+    self.Set("special_folders", folders)
+    return self
 
 
 class Users(protodict.RDFValueArray):
@@ -151,6 +176,10 @@ class Users(protodict.RDFValueArray):
 class KnowledgeBase(rdfvalue.RDFProtoStruct):
   """Information about the system and users."""
   protobuf = knowledge_base_pb2.KnowledgeBase
+
+  def _CreateNewUser(self, kb_user):
+    self.users.Append(kb_user)
+    return ["users.%s" % k for k in kb_user.AsDict().keys()]
 
   def MergeOrAddUser(self, kb_user):
     """Merge a user into existing users or add new if it doesn't exist.
@@ -166,8 +195,7 @@ class KnowledgeBase(rdfvalue.RDFProtoStruct):
     new_attrs = []
     merge_conflicts = []    # Record when we overwrite a value.
     if not user:
-      self.users.Append(kb_user)
-      new_attrs = ["users.%s" % k for k in kb_user.AsDict().keys()]
+      new_attrs = self._CreateNewUser(kb_user)
     else:
       for key, val in kb_user.AsDict().items():
         if user.Get(key) and user.Get(key) != val:
@@ -178,15 +206,28 @@ class KnowledgeBase(rdfvalue.RDFProtoStruct):
     return new_attrs, merge_conflicts
 
   def GetUser(self, sid=None, uid=None, username=None):
-    """Retrieve a KnowledgeBaseUser based on sid, uid or username."""
+    """Retrieve a KnowledgeBaseUser based on sid, uid or username.
+
+    If a sid or uid is provided, don't match by username to avoid combining
+    users with name collisions (such as local vs. domain users on Windows).
+
+    Args:
+      sid: Windows user sid
+      uid: Linux/Darwin user id
+      username: string
+    Returns:
+      rdfvalue.KnowledgeBaseUser or None
+    """
     if sid:
       for user in self.users:
         if user.sid == sid:
           return user
+      return None
     if uid:
       for user in self.users:
         if user.uid == uid:
           return user
+      return None
     if username:
       for user in self.users:
         if user.username == username:
@@ -587,20 +628,14 @@ class WMIRequest(rdfvalue.RDFProtoStruct):
   protobuf = jobs_pb2.WmiRequest
 
 
-class LaunchdJob(rdfvalue.RDFProtoStruct):
-  protobuf = sysinfo_pb2.LaunchdJob
+class WindowsServiceInformation(rdfvalue.RDFProtoStruct):
+  """Windows Service."""
+  protobuf = sysinfo_pb2.WindowsServiceInformation
 
 
-class Service(rdfvalue.RDFProtoStruct):
-  """Structure of a running service."""
-  protobuf = sysinfo_pb2.Service
-
-  rdf_map = dict(osx_launchd=LaunchdJob)
-
-
-class Services(protodict.RDFValueArray):
-  """Structure of a running service."""
-  rdf_type = Service
+class OSXServiceInformation(rdfvalue.RDFProtoStruct):
+  """OSX Service (launchagent/daemon)."""
+  protobuf = sysinfo_pb2.OSXServiceInformation
 
 
 class ClientResources(rdfvalue.RDFProtoStruct):

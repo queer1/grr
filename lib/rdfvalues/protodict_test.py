@@ -14,6 +14,7 @@ an __iter__) method, but are serializable as an RDFProto.
 
 
 from grr.lib import rdfvalue
+from grr.lib.rdfvalues import structs
 from grr.lib.rdfvalues import test_base
 
 
@@ -55,6 +56,7 @@ class DictTest(test_base.RDFProtoTestCase):
         key3=u"\u4f60\u597d",  # Unicode.
         key5=rdfvalue.RDFDatetime("2012/12/11"),  # RDFValue.
         key6=None,             # Support None Encoding.
+        key7=structs.Enum(5, name="Test"),  # Integer like objects.
         )
 
     # Initialize through keywords.
@@ -170,3 +172,26 @@ class RDFValueArrayTest(test_base.RDFProtoTestCase):
     self.assertEqual(sample.Pop(), "hello")
     self.assertEqual(sample.Pop(1), "!")
     self.assertEqual(sample.Pop(), "world")
+
+
+class EmbeddedRDFValueTest(test_base.RDFProtoTestCase):
+  rdfvalue_class = rdfvalue.EmbeddedRDFValue
+
+  def GenerateSample(self, number=0):
+    return rdfvalue.EmbeddedRDFValue(rdfvalue.RDFValueArray([number]))
+
+  def testAgePreserved(self):
+    data = rdfvalue.RDFValueArray([1, 2, 3])
+    now = rdfvalue.RDFDatetime().Now()
+    original_age = data.age.Now()
+
+    self.assertTrue((now - data.age) < rdfvalue.Duration("5s"))
+
+    embedded = rdfvalue.EmbeddedRDFValue(payload=data)
+    self.assertEqual(embedded.payload.age, original_age)
+
+    new_log = rdfvalue.EmbeddedRDFValue(embedded).payload
+    self.assertEqual(new_log.age, original_age, "Age not preserved: %s != %s" %
+                     (new_log.age.AsMicroSecondsFromEpoch(),
+                      original_age.AsMicroSecondsFromEpoch()))
+

@@ -44,7 +44,7 @@ class ClientCrashEventListener(flow.EventListener):
 
   def _AppendCrashDetails(self, path, crash_details):
     collection = aff4.FACTORY.Create(
-        path, "RDFValueCollection", mode="rw", token=self.token)
+        path, "PackedVersionedCollection", mode="rw", token=self.token)
 
     collection.Add(crash_details)
     collection.Close(sync=False)
@@ -724,6 +724,13 @@ class KeepAliveArgs(rdfvalue.RDFProtoStruct):
 class KeepAlive(flow.GRRFlow):
   """Requests that the clients stays alive for a period of time."""
 
+  # We already want to run this flow while waiting for a client approval.
+  # Note that this can potentially be abused to launch a DDOS attack against
+  # the frontend server(s) by putting all clients into fastpoll mode. The load
+  # of idle polling messages is not that high though and this can only be done
+  # by users that have a GRR account already so the risk is acceptable.
+  ACL_ENFORCED = False
+
   category = "/Administrative/"
   behaviours = flow.GRRFlow.behaviours + "BASIC"
 
@@ -843,10 +850,6 @@ class RunReport(flow.GRRGlobalFlow):
 
   @flow.StateHandler(next_state="RunReport")
   def Start(self):
-    if not data_store.DB.security_manager.CheckUserLabels(
-        self.token.username, self.AUTHORIZED_LABELS):
-      raise access_control.UnauthorizedAccess("Must be admin to run this flow.")
-
     if self.state.args.report_name not in reports.Report.classes:
       raise flow.FlowError("No such report %s" % self.state.args.report_name)
     else:

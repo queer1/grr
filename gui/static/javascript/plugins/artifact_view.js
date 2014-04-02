@@ -6,6 +6,33 @@ var grr = window.grr || {};
 grr.artifact_view = {};
 
 
+grr.Renderer('ArtifactRDFValueRenderer', {
+  Layout: function(state) {
+    var unique = state.unique;
+    var artifact_str = state.artifact_str;
+
+    var description_element = unique + '_artifact_description';
+    var artifact_obj = JSON.parse(artifact_str);
+    grr.artifact_view.renderArtifactFromObject(artifact_obj,
+                                               description_element);
+    // Remove heading to clean up display.
+    $('div[name=artifact_name]').hide();
+  }
+});
+
+
+grr.Renderer('ArtifactManagerToolbar', {
+  Layout: function(state) {
+    var unique = state.unique;
+
+    $('#upload_dialog_' + unique).on('show', function() {
+      grr.layout('ArtifactJsonUploadView',
+                 'upload_dialog_body_' + unique);
+    });
+  }
+});
+
+
 grr.Renderer('ArtifactListRenderer', {
   Layout: function(state) {
     // Populate the artifact manager.
@@ -183,7 +210,7 @@ grr.artifact_view.renderArtifactFromObject = function(artifact, element) {
       processor_row = '<tr><td>Parser<td>' + processor.name + '</tr>';
       processor_row += '<tr><td>Output types<td>' + processor.output_types +
           '</tr>';
-      processor_row += '<tr><td>Description<td>' + processor.description +
+      processor_row += '<tr><td>Description<td>' + processor.doc +
           '</tr>';
       processor_row += '<tr><td></tr>';
       $(processor_element).append(processor_row);
@@ -198,6 +225,9 @@ grr.artifact_view.renderArtifactFromObject = function(artifact, element) {
     $.each(artifact.collectors, function(index, collector) {
       collector_row = '<tr><td>Action<td>' + collector.action + '</tr>';
       $.each(collector.args, function(name, value) {
+        if ($.isArray(value)) {
+          value = value.join('<br>');
+        }
         collector_row += '<tr><td>arg:' + name + '<td>' + value + '</tr>';
       });
       collector_row += '<tr><td></tr>';

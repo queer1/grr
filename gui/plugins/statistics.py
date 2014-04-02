@@ -30,13 +30,6 @@ class ReportRenderer(renderers.TemplateRenderer):
   {% endif %}
   <div id="{{unique|escape}}"></div>
 </div>
-<script>
-  grr.subscribe("tree_select", function(path) {
-    grr.state.path = path
-    $("#{{id|escapejs}}").html("<em>Loading&#8230;</em>");
-    grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}");
-  }, "{{unique|escapejs}}");
-</script>
 """)
 
   def Layout(self, request, response):
@@ -52,7 +45,9 @@ class ReportRenderer(renderers.TemplateRenderer):
         self.delegated_renderer.Layout(request, response)
         break
 
-    return super(ReportRenderer, self).Layout(request, response)
+    response = super(ReportRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "ReportRenderer.Layout",
+                               renderer=self.__class__.__name__)
 
 
 class StatsTree(renderers.TreeRenderer):
@@ -86,6 +81,7 @@ class StatsTree(renderers.TreeRenderer):
 class Report(renderers.TemplateRenderer):
   """This is the base of all Statistic Reports."""
   category = None
+  SYSTEM_USERS = set(["GRRWorker", "GRREnroller", "GRRCron"])
 
   layout_template = renderers.Template("""
 <div class="padded">
@@ -286,11 +282,17 @@ class StatGraph(object):
     self.series.append(StatData(series_name, ",".join(map(str, data))))
     self.downsample = downsample_ratio
 
+  def ToDict(self):
+    return dict(self.__dict__, series=[s.ToDict() for s in self.series])
+
 
 class StatData(object):
   def __init__(self, label, data):
     self.data = data
     self.label = label
+
+  def ToDict(self):
+    return self.__dict__
 
 
 class AFF4ClientStats(Report):
@@ -302,28 +304,6 @@ class AFF4ClientStats(Report):
   layout_template = renderers.Template("""
 <div class="padded">
 {% if this.graphs %}
-<script>
-selectTab = function (tabid) {
-  {% for graph in this.graphs %}
-      $("#{{unique|escapejs}}_{{graph.id|escapejs}}")[0]
-          .style.display = "none";
-      $("#{{unique|escapejs}}_{{graph.id|escapejs}}_a")
-          .removeClass("selected");
-  {% endfor %}
-
-  $("#{{unique|escapejs}}_" + tabid)[0].style.display = "block";
-  $("#{{unique|escapejs}}_click").text("");
-  $("#{{unique|escapejs}}_" + tabid + "_a").addClass("selected");
-
-  $("#{{unique|escapejs}}_" + tabid)[0].style.visibility = "hidden";
-  $("#{{id|escapejs}}").resize();
-  p = eval("plot_" + tabid);
-  p.resize();
-  p.setupGrid();
-  p.draw();
-  $("#{{unique|escapejs}}_" + tabid)[0].style.visibility = "visible";
-};
-</script>
 
 {% for graph in this.graphs %}
   <a id="{{unique|escape}}_{{graph.id|escape}}_a"
@@ -334,47 +314,8 @@ selectTab = function (tabid) {
 <div id="{{unique|escape}}_graphs" style="height:100%;">
 {% for graph in this.graphs %}
   <div id="{{unique|escape}}_{{graph.id|escape}}" class="grr_graph"></div>
-  <script>
-      var specs_{{graph.id|escapejs}} = [];
-
-  {% for stats in graph.series %}
-    specs_{{graph.id|escapejs}}.push({
-      label: "{{stats.label|escapejs}}",
-      data: [
-        {{stats.data|escapejs}}
-      ],
-    });
-  {% endfor %}
-    var options_{{graph.id|escapejs}} = {
-      xaxis: {mode: "time",
-              timeformat: "%y/%m/%d - %H:%M:%S"},
-      lines: {show: true},
-      points: {show: true},
-      zoom: {interactive: true},
-      pan: {interactive: true},
-      grid: {clickable: true, autohighlight: true},
-    };
-
-    var placeholder = $("#{{unique|escapejs}}_{{graph.id|escapejs}}");
-    var plot_{{graph.id|escapejs}} = $.plot(
-            placeholder, specs_{{graph.id|escapejs}},
-            options_{{graph.id|escapejs}});
-
-    placeholder.bind("plotclick", function(event, pos, item) {
-      if (item) {
-        var date = new Date(item.datapoint[0]);
-        var msg = "{{graph.click_text|escapejs}}";
-        msg = msg.replace("%date", date.toString())
-        msg = msg.replace("%value", item.datapoint[1])
-        $("#{{unique|escapejs}}_click").text(msg);
-      };
-    });
-  </script>
-  {% endfor %}
+{% endfor %}
 </div>
-<script>
-  selectTab("cpu");
-</script>
 {% else %}
   <h3>No data Available</h3>
 {% endif %}
@@ -470,7 +411,9 @@ selectTab = function (tabid) {
     graph.AddSeries(series, "Network Bytes Sent in MB", max_samples)
     self.graphs.append(graph)
 
-    return super(AFF4ClientStats, self).Layout(request, response)
+    response = super(AFF4ClientStats, self).Layout(request, response)
+    return self.CallJavascript(response, "AFF4ClientStats.Layout",
+                               graphs=[g.ToDict() for g in self.graphs])
 
 
 def GetAgeTupleFromRequest(request, default_days=90):
@@ -497,7 +440,7 @@ class CustomXAxisChart(Report):
   def Layout(self, request, response):
     """Set X,Y values."""
     try:
-      fd = aff4.FACTORY.Open(self.data_urn)
+      fd = aff4.FACTORY.Open(self.data_urn, token=request.token)
       self.graph = fd.Get(self.attribute)
 
       self.data = []
@@ -526,7 +469,7 @@ class LogXAxisChart(CustomXAxisChart):
 
   def Layout(self, request, response):
     try:
-      fd = aff4.FACTORY.Open(self.data_urn)
+      fd = aff4.FACTORY.Open(self.data_urn, token=request.token)
       self.graph = fd.Get(self.attribute)
 
       self.data = []
@@ -613,5 +556,3 @@ class FileClientCount(CustomXAxisChart):
   category = "/FileStore/ClientCounts"
   data_urn = "aff4:/stats/FileStoreStats"
   attribute = aff4.FilestoreStats.SchemaCls.FILESTORE_CLIENTCOUNT_HISTOGRAM
-
-

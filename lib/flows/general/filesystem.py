@@ -8,6 +8,9 @@ import stat
 from grr.lib import aff4
 from grr.lib import flow
 from grr.lib import rdfvalue
+
+
+from grr.lib.aff4_objects import aff4_grr
 from grr.proto import flows_pb2
 
 
@@ -38,7 +41,7 @@ class ListDirectory(flow.GRRFlow):
 
   category = "/Filesystem/"
   args_type = ListDirectoryArgs
-  behaviours = flow.GRRFlow.behaviours + "BASIC"
+  behaviours = flow.GRRFlow.behaviours + "ADVANCED"
 
   @flow.StateHandler(next_state=["List", "Stat"])
   def Start(self):
@@ -250,6 +253,181 @@ class RecursiveListDirectory(flow.GRRFlow):
     self.Status(status_text, self.state.file_count, self.state.dir_count)
 
 
+class UpdateSparseImageChunksArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.UpdateSparseImageChunksArgs
+
+
+class UpdateSparseImageChunks(flow.GRRFlow):
+  """Updates a list of chunks of a sparse image from the client."""
+
+  category = "/Filesystem/"
+  args_type = UpdateSparseImageChunksArgs
+
+  def GetBufferForChunk(self, chunk):
+    chunk_offset = chunk * self.state.chunksize
+    request = rdfvalue.BufferReference(pathspec=self.state.pathspec,
+                                       length=self.state.chunksize,
+                                       offset=chunk_offset)
+    return request
+
+  @flow.StateHandler(next_state="UpdateChunk")
+  def Start(self):
+
+    fd = aff4.FACTORY.Open(self.state.args.file_urn, token=self.token,
+                           aff4_type="AFF4SparseImage", mode="rw")
+
+    pathspec = fd.Get(fd.Schema.PATHSPEC)
+    self.state.Register("pathspec", pathspec)
+    self.state.Register("fd", fd)
+    self.state.Register("chunksize", fd.chunksize)
+    self.state.Register("missing_chunks", self.state.args.chunks_to_fetch)
+
+    if self.state.missing_chunks:
+      # TODO(user): At the moment we aren't using deduplication, since
+      # we're transferring every chunk from the client, regardless of whether
+      # it's a known blob. We should do something similar to MultiGetFile here
+      # instead.
+      chunk = self.state.missing_chunks.Pop(0)
+      request = self.GetBufferForChunk(chunk)
+      self.CallClient("TransferBuffer", request, next_state="UpdateChunk")
+
+  @flow.StateHandler(next_state="UpdateChunk")
+  def UpdateChunk(self, responses):
+    if not responses.success:
+      raise IOError("Error running TransferBuffer: %s" % responses.status)
+
+    response = responses.First()
+
+    if len(self.state.missing_chunks) >= 1:
+      chunk_number = response.offset / self.state.chunksize
+      self.state.fd.AddBlob(blob_hash=response.data,
+                            length=response.length,
+                            chunk_number=chunk_number)
+
+      self.state.fd.Flush()
+
+      next_chunk = self.state.missing_chunks.Pop(0)
+      request = self.GetBufferForChunk(next_chunk)
+      self.CallClient("TransferBuffer", request, next_state="UpdateChunk")
+
+
+class FetchBufferForSparseImageArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.FetchBufferForSparseImageArgs
+
+
+class FetchBufferForSparseImage(flow.GRRFlow):
+  """Reads data from a client-side file, specified by a length and offset.
+
+  This data is written to an AFF4SparseImage object. Note that
+  more data than is requested may be read since we align reads to chunks.
+  """
+
+  category = "/Filesystem/"
+  args_type = FetchBufferForSparseImageArgs
+
+  @flow.StateHandler(next_state="TransferBuffer")
+  def Start(self):
+
+    urn = self.state.args.file_urn
+
+    fd = aff4.FACTORY.Open(urn, token=self.token, aff4_type="AFF4SparseImage",
+                           mode="rw")
+    self.state.Register("fd", fd)
+
+    pathspec = fd.Get(fd.Schema.PATHSPEC)
+
+    # Use the object's chunk size, in case it's different to the class-wide
+    # chunk size.
+    chunksize = fd.chunksize
+    self.state.Register("pathspec", pathspec)
+    self.state.Register("chunksize", chunksize)
+
+    # Make sure we always read a whole number of chunks.
+    new_length, new_offset = self.AlignToChunks(self.state.args.length,
+                                                self.state.args.offset,
+                                                chunksize)
+
+    # Remember where we're up to in reading the file, and how much we have left
+    # to read.
+    self.state.Register("bytes_left_to_read", new_length)
+    self.state.Register("current_offset", new_offset)
+
+    # Always read one chunk at a time.
+    request = rdfvalue.BufferReference(pathspec=self.state.pathspec,
+                                       length=self.state.chunksize,
+                                       offset=self.state.current_offset)
+
+    # Remember where we're up to, and that we're about to read one chunk.
+    self.state.bytes_left_to_read -= chunksize
+    self.state.current_offset += chunksize
+
+    self.CallClient("TransferBuffer", request,
+                    next_state="TransferBuffer")
+
+  @flow.StateHandler(next_state="TransferBuffer")
+  def TransferBuffer(self, responses):
+    # Did it work?
+    if not responses.success:
+      raise IOError("Error running TransferBuffer: %s" % responses.status)
+
+    response = responses.First()
+
+    # Write the data we got from the client to the file.
+    sparse_image = self.state.fd
+    chunk_number = response.offset / sparse_image.chunksize
+    sparse_image.AddBlob(blob_hash=response.data,
+                         length=response.length,
+                         chunk_number=chunk_number)
+    sparse_image.Flush()
+
+    length_to_read = min(self.state.chunksize,
+                         self.state.bytes_left_to_read)
+
+    if length_to_read:
+      request = rdfvalue.BufferReference(pathspec=self.state.pathspec,
+                                         length=length_to_read,
+                                         offset=self.state.current_offset)
+
+      # TODO(user): Again, this is going to be too slow, since we're
+      # waiting for a client response every time we request a buffer. We need to
+      # queue up multiple reads.
+      self.CallClient("TransferBuffer", request,
+                      next_state="TransferBuffer")
+
+      # Move our offset along the file by how much we read.
+      self.state.current_offset += length_to_read
+      # Remember how much more we need to read.
+      self.state.bytes_left_to_read = max(
+          0,
+          self.state.bytes_left_to_read - length_to_read)
+
+  @staticmethod
+  def AlignToChunks(length, offset, chunksize):
+    """Make sure that if we are reading part of a chunk, we read all of it.
+
+    Args:
+      length: How much data to read.
+      offset: Where in the file to read it from.
+      chunksize: How big the chunks in the file are.
+
+    Returns:
+      A (length, offset) tuple, containing the length and offset
+      required to read all affected chunks.
+    """
+    start_chunk = offset / chunksize
+    end_chunk = (offset + length) / chunksize
+    # If we happened to round down to the beginning of the end chunk, make sure
+    # to read to the end of it (which is the beginning of the next chunk).
+    if (offset + length) % chunksize != 0:
+      end_chunk += 1
+
+    # New offset starts from the beginning of the start chunk.
+    new_offset = start_chunk * chunksize
+    new_length = (end_chunk * chunksize) - new_offset
+
+    return new_length, new_offset
+
+
 class SlowGetFileArgs(rdfvalue.RDFProtoStruct):
   protobuf = flows_pb2.SlowGetFileArgs
 
@@ -413,8 +591,81 @@ class SlowGetFile(flow.GRRFlow):
       self.state.fd.Flush()
 
 
+class MakeNewAFF4SparseImageArgs(rdfvalue.RDFProtoStruct):
+  protobuf = flows_pb2.MakeNewAFF4SparseImageArgs
+
+
+class MakeNewAFF4SparseImage(flow.GRRFlow):
+  """Gets a new file from the client, possibly as an AFF4SparseImage.
+
+  If the filesize is >= the size threshold, then we get the file as an empty
+  AFF4SparseImage, otherwise we just call GetFile, which gets the complete file.
+
+  We do the check to see if the file is big enough to get as an AFF4SparseImage
+  in this flow so we don't need to do another round trip to the client.
+
+  Args:
+    pathspec: Pathspec of the file to look at.
+    size_threshold: If the file is bigger than this size, we'll get it as an
+    empty AFF4SparseImage, otherwise we'll just download the whole file as
+    usual with GetFile.
+  """
+
+  category = "/Filesystem/"
+  args_type = MakeNewAFF4SparseImageArgs
+
+  @flow.StateHandler(next_state="ProcessStat")
+  def Start(self):
+    self.CallClient("StatFile", pathspec=self.state.args.pathspec,
+                    next_state="ProcessStat")
+
+  @flow.StateHandler(next_state="End")
+  def ProcessStat(self, responses):
+    # Did it work?
+    if not responses.success:
+      # It's better to raise rather than merely logging since it will
+      # make it to the flow's protobuf and users can
+      # inspect the reason this flow failed.
+      raise IOError("Could not stat file: %s" % responses.status)
+
+    client_stat = responses.First()
+
+    # Update the pathspec to the one we got from the client.
+    self.state.Register("pathspec", client_stat.pathspec)
+
+    # If the file was big enough, we'll store it as an AFF4SparseImage
+    if client_stat.st_size > self.state.args.size_threshold:
+      urn = aff4_grr.VFSGRRClient.PathspecToURN(self.state.pathspec,
+                                                self.client_id)
+
+      fd = aff4.FACTORY.Open(urn, token=self.token)
+
+      # TODO(user) When we can check the last update time of the
+      # contents of a file, raise if the contents have been updated before here.
+
+      fd = aff4.FACTORY.Create(urn, aff4_type="AFF4SparseImage",
+                               token=self.token, mode="rw")
+      fd.Set(fd.Schema.PATHSPEC, self.state.pathspec)
+      fd.Set(fd.Schema.STAT, client_stat)
+      fd.Flush()
+    else:
+      # Otherwise, just get the whole file.
+      self.CallFlow("MultiGetFile", pathspecs=[self.state.pathspec],
+                    next_state="End")
+
+  @flow.StateHandler()
+  def End(self, responses):
+    # Check that the GetFile flow worked.
+    if not responses.success:
+      raise IOError("Could not get file: %s" % responses.status)
+
+
 class GlobArgs(rdfvalue.RDFProtoStruct):
   protobuf = flows_pb2.GlobArgs
+
+  def Validate(self):
+    """Ensure that the glob paths are valid."""
+    self.paths.Validate()
 
 
 class Glob(flow.GRRFlow):
@@ -433,7 +684,9 @@ class Glob(flow.GRRFlow):
 
   # A regex indicating if there are shell globs in this path.
   GLOB_MAGIC_CHECK = re.compile("[*?[]")
-  RECURSION_REGEX = re.compile(r"\*\*(\d*)")
+
+  # Maximum number of files to inspect in a single directory
+  FILE_MAX_PER_DIR = 100000
 
   def ConvertGlobIntoPathComponents(self, pattern):
     """Converts a glob pattern into a list of pathspec components.
@@ -457,22 +710,17 @@ class Glob(flow.GRRFlow):
     Raises:
       ValueError: If the glob is invalid.
     """
-    starstar_used = False
 
     components = []
     for path_component in pattern.split("/"):
       # A ** in the path component means recurse into directories that match the
       # pattern.
-      m = self.RECURSION_REGEX.search(path_component)
+      m = rdfvalue.GlobExpression.RECURSION_REGEX.search(path_component)
       if m:
-        if starstar_used:
-          raise ValueError("wildcards ** can be used once per path at most.")
-
-        starstar_used = True
         path_component = path_component.replace(m.group(0), "*")
 
         component = rdfvalue.PathSpec(
-            path="(?i)^" + fnmatch.translate(path_component),
+            path=fnmatch.translate(path_component),
             path_options=rdfvalue.PathSpec.Options.RECURSIVE)
 
         # Allow the user to override the recursion depth.
@@ -481,8 +729,7 @@ class Glob(flow.GRRFlow):
 
       elif self.GLOB_MAGIC_CHECK.search(path_component):
         component = rdfvalue.PathSpec(
-            # We have to prefix the regex with the ignore case flag here.
-            path="(?i)^" + fnmatch.translate(path_component),
+            path=fnmatch.translate(path_component),
             path_options=rdfvalue.PathSpec.Options.REGEX)
       else:
         component = rdfvalue.PathSpec(
@@ -532,7 +779,10 @@ class Glob(flow.GRRFlow):
 
     # Process the component tree from the root.
     root = rdfvalue.StatEntry()
-    root.pathspec.path = "/"
+    root.pathspec = self.state.args.root_path
+    if not root.pathspec:
+      root.pathspec.path = "/"
+    # root_path.pathtype overridden by user-settable args.pathtype
     root.pathspec.pathtype = self.state.args.pathtype
     self.CallStateInline(messages=[root], next_state="ProcessEntry",
                          request_data=dict(component_path=[]))
@@ -563,8 +813,20 @@ class Glob(flow.GRRFlow):
     component_path = responses.request_data["component_path"]
     node = self.FindNode(component_path)
 
+    # If we get a response with an unfinished iterator then we missed some
+    # files. Call Find on the client until we're done.
+    if (responses.iterator and responses.iterator.state !=
+        responses.iterator.State.FINISHED):
+      findspec = rdfvalue.FindSpec(responses.request.request.args)
+      findspec.iterator = responses.iterator
+      self.CallClient("Find", findspec,
+                      next_state="ProcessEntry",
+                      request_data=responses.request_data)
+
+    regexes_to_get = []
+    recursions_to_get = {}
     for response in responses:
-      # The Find client action does not return a StatEntry but an
+      # The Find client action does not return a StatEntry but a
       # FindSpec. Normalize to a StatEntry.
       if isinstance(response, rdfvalue.FindSpec):
         response = response.hit
@@ -578,42 +840,24 @@ class Glob(flow.GRRFlow):
           # Use the pathtype from the flow args.
           component.pathtype = self.state.args.pathtype
           if component.path_options == component.Options.RECURSIVE:
-            findspec = rdfvalue.FindSpec(pathspec=response.pathspec,
-                                         cross_devs=True,
-                                         max_depth=component.recursion_depth,
-                                         path_regex=component.path)
-
-            # We don't really support iteration here, so we make sure we will
-            # check all the files in this directory.
-            findspec.iterator.number = 100000
-            self.CallClient("Find", findspec,
-                            next_state="ProcessEntry",
-                            request_data=dict(component_path=next_component))
-
+            recursions_to_get.setdefault(component.recursion_depth, []).append(
+                component)
           elif component.path_options == component.Options.REGEX:
-            findspec = rdfvalue.FindSpec(pathspec=response.pathspec,
-                                         max_depth=1,
-                                         path_regex=component.path)
-
-            # We don't really support iteration here, so we make sure we will
-            # check all the files in this directory.
-            findspec.iterator.number = 100000
-            self.CallClient("Find", findspec,
-                            next_state="ProcessEntry",
-                            request_data=dict(component_path=next_component))
+            regexes_to_get.append(component)
 
           elif component.path_options == component.Options.CASE_INSENSITIVE:
             # Check for the existence of the last node.
             if not next_node:
-              findspec = rdfvalue.FindSpec(
-                  pathspec=response.pathspec,
-                  max_depth=1, path_regex="(?i)^" + component.path + "$")
+              pathspec = response.pathspec.Copy().AppendPath(component.path)
+              request = rdfvalue.ListDirRequest(pathspec=pathspec)
 
-              # If next node is empty, this node is a leaf node, we therefore
-              # must stat it to check that it is there.
-              self.CallClient("Find", findspec,
-                              next_state="ProcessEntry",
-                              request_data=dict(component_path=next_component))
+              if response.st_mode == 0 or not stat.S_ISREG(response.st_mode):
+                # If next node is empty, this node is a leaf node, we therefore
+                # must stat it to check that it is there.
+                self.CallClient(
+                    "StatFile", request, next_state="ProcessEntry",
+                    request_data=dict(component_path=next_component))
+
             else:
               pathspec = response.pathspec.Copy().AppendPath(component.path)
 
@@ -625,6 +869,33 @@ class Glob(flow.GRRFlow):
                   next_state="ProcessEntry",
                   request_data=dict(component_path=next_component))
 
+        if recursions_to_get:
+          for depth, recursions in recursions_to_get.iteritems():
+            path_regex = "(?i)^" + "$|^".join(
+                set([c.path for c in recursions])) + "$"
+
+            findspec = rdfvalue.FindSpec(pathspec=response.pathspec,
+                                         cross_devs=True,
+                                         max_depth=depth,
+                                         path_regex=path_regex)
+
+            findspec.iterator.number = self.FILE_MAX_PER_DIR
+            self.CallClient("Find", findspec,
+                            next_state="ProcessEntry",
+                            request_data=dict(component_path=next_component))
+
+        if regexes_to_get:
+          path_regex = "(?i)^" + "$|^".join(
+              set([c.path for c in regexes_to_get])) + "$"
+          findspec = rdfvalue.FindSpec(pathspec=response.pathspec,
+                                       max_depth=1,
+                                       path_regex=path_regex)
+
+          findspec.iterator.number = self.FILE_MAX_PER_DIR
+          self.CallClient("Find", findspec,
+                          next_state="ProcessEntry",
+                          request_data=dict(component_path=next_component))
+
       else:
-        # Node is empty representing a leaf node - we found a hit - report i.
+        # Node is empty representing a leaf node - we found a hit - report it.
         self.ReportMatch(response)

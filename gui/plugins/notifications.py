@@ -1,11 +1,6 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
-
 """This plugin renders the client search page."""
-import json
 import urllib
-
-from django import http
 
 from grr.gui import renderers
 from grr.gui.plugins import forms
@@ -34,9 +29,7 @@ class NotificationCount(renderers.TemplateRenderer):
     except IOError:
       pass
 
-    encoder = json.JSONEncoder()
-    return http.HttpResponse(encoder.encode(dict(number=number)),
-                             content_type="text/json")
+    return renderers.JsonResponse(dict(number=number))
 
 
 class NotificationBar(renderers.TemplateRenderer):
@@ -213,7 +206,8 @@ class ViewNotifications(renderers.TableRenderer):
     flow.GRRFlow.StartFlow(flow_name="ResetUserNotifications",
                            token=request.token)
 
-  def BuildHashFromNotification(self, notification):
+  @staticmethod
+  def BuildHashFromNotification(notification):
     """Navigate to the most appropriate location for this navigation."""
     h = {}
 

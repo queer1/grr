@@ -46,7 +46,6 @@ import operator
 import time
 
 
-from M2Crypto import RSA
 from M2Crypto import X509
 
 import logging
@@ -102,7 +101,7 @@ class Responses(object):
 
       # The iterator that was returned as part of these responses. This should
       # be passed back to actions that expect an iterator.
-      self.iterator = rdfvalue.Iterator()
+      self.iterator = None
 
       # Filter the responses by authorized states
       for msg in responses:
@@ -110,14 +109,15 @@ class Responses(object):
         if msg.auth_state == msg.AuthorizationState.DESYNCHRONIZED or (
             self._auth_required and
             msg.auth_state != msg.AuthorizationState.AUTHENTICATED):
-          logging.info("%s: Messages must be authenticated (Auth state %s)",
-                       msg.session_id, msg.auth_state)
+          logging.warning("%s: Messages must be authenticated (Auth state %s)",
+                          msg.session_id, msg.auth_state)
           self._dropped_responses.append(msg)
           # Skip this message - it is invalid
           continue
 
         # Check for iterators
         if msg.type == msg.Type.ITERATOR:
+          self.iterator = rdfvalue.Iterator()
           self.iterator.ParseFromString(msg.args)
           continue
 
@@ -204,6 +204,7 @@ class FakeResponses(Responses):
     self.success = True
     self._responses = messages
     self.request_data = request_data
+    self.iterator = None
 
   def __iter__(self):
     return iter(self._responses)
@@ -260,29 +261,38 @@ def StateHandler(next_state="End", auth_required=True):
       runner = self.GetRunner()
       next_states = Decorated.next_states
 
-      if direct_response is not None:
-        return f(self, direct_response)
+      old_next_states = runner.GetAllowedFollowUpStates()
+      try:
+        if direct_response is not None:
+          runner.SetAllowedFollowUpStates(next_states)
+          return f(self, direct_response)
 
-      if isinstance(responses, Responses):
-        next_states.update(responses.next_states)
-      else:
-        # Prepare a responses object for the state method to use:
-        responses = Responses(request=request,
-                              next_states=next_states,
-                              responses=responses,
-                              auth_required=auth_required)
+        if isinstance(responses, Responses):
+          next_states.update(responses.next_states)
+        else:
+          # Prepare a responses object for the state method to use:
+          responses = Responses(request=request,
+                                next_states=next_states,
+                                responses=responses,
+                                auth_required=auth_required)
 
-        if responses.status:
-          runner.SaveResourceUsage(request, responses)
+          if responses.status:
+            runner.SaveResourceUsage(request, responses)
 
-      stats.STATS.IncrementCounter("grr_worker_states_run")
-      runner.SetAllowedFollowUpStates(next_states)
+        stats.STATS.IncrementCounter("grr_worker_states_run")
+        runner.SetAllowedFollowUpStates(next_states)
 
-      # Run the state method (Allow for flexibility in prototypes)
-      args = [self, responses]
-      res = f(*args[:f.func_code.co_argcount])
+        if f.__name__ == "Start":
+          stats.STATS.IncrementCounter("flow_starts",
+                                       fields=[self.Name()])
 
-      return res
+        # Run the state method (Allow for flexibility in prototypes)
+        args = [self, responses]
+        res = f(*args[:f.func_code.co_argcount])
+
+        return res
+      finally:
+        runner.SetAllowedFollowUpStates(old_next_states)
 
     # Make sure the state function itself knows where its allowed to
     # go (This is used to introspect the state graph).
@@ -485,7 +495,7 @@ class GRRFlow(aff4.AFF4Volume):
     return cls.args_type()
 
   @classmethod
-  def _FilterArgsFromSemanticProtobuf(cls, protobuf, kwargs):
+  def FilterArgsFromSemanticProtobuf(cls, protobuf, kwargs):
     """Assign kwargs to the protobuf, and remove them from the kwargs dict."""
     for descriptor in protobuf.type_infos:
       value = kwargs.pop(descriptor.name, None)
@@ -644,6 +654,7 @@ class GRRFlow(aff4.AFF4Volume):
                       responses=None):
     if responses is None:
       responses = FakeResponses(messages, request_data)
+
     getattr(self, next_state)(self.runner, direct_response=responses)
 
   def CallState(self, messages=None, next_state="", request_data=None,
@@ -711,7 +722,7 @@ class GRRFlow(aff4.AFF4Volume):
     if runner_args is None:
       runner_args = FlowRunnerArgs()
 
-    cls._FilterArgsFromSemanticProtobuf(runner_args, kwargs)
+    cls.FilterArgsFromSemanticProtobuf(runner_args, kwargs)
 
     # When asked to run a flow in the future this implied it will run
     # asynchronously.
@@ -746,11 +757,17 @@ class GRRFlow(aff4.AFF4Volume):
     flow_obj = aff4.FACTORY.Create(None, runner_args.flow_name,
                                    token=token)
 
+    # Also check for needed labels.
+    if flow_obj.AUTHORIZED_LABELS:
+      data_store.DB.security_manager.CheckUserLabels(
+          runner_args.token.username, flow_obj.AUTHORIZED_LABELS,
+          runner_args.token)
+
     # Now parse the flow args into the new object from the keywords.
     if args is None:
       args = flow_obj.args_type()
 
-    cls._FilterArgsFromSemanticProtobuf(args, kwargs)
+    cls.FilterArgsFromSemanticProtobuf(args, kwargs)
 
     # Check that the flow args are valid.
     args.Validate()
@@ -807,7 +824,8 @@ class GRRFlow(aff4.AFF4Volume):
         Events.PublishEvent("Audit",
                             rdfvalue.AuditEvent(user=token.username,
                                                 action="RUN_FLOW",
-                                                flow=runner_args.flow_name,
+                                                flow_name=runner_args.flow_name,
+                                                urn=flow_obj.urn,
                                                 client=runner_args.client_id),
                             token=token)
 
@@ -1367,36 +1385,7 @@ class ServerCommunicator(communicator.Communicator):
     """
     result = rdfvalue.GrrMessage.AuthorizationState.UNAUTHENTICATED
     try:
-      if api_version >= 3:
-        # New version:
-        if cipher.HMAC(response_comms.encrypted) != response_comms.hmac:
-          raise communicator.DecryptionError("HMAC does not match.")
-
-        if cipher.signature_verified:
-          result = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
-
-      else:
-        # Fake the metadata
-        cipher.cipher_metadata = rdfvalue.CipherMetadata(
-            source=signed_message_list.source)
-
-        # Verify the incoming message.
-        digest = cipher.hash_function(
-            signed_message_list.message_list).digest()
-
-        remote_public_key = self.pub_key_cache.GetRSAPublicKey(
-            common_name=signed_message_list.source)
-
-        try:
-          stats.STATS.IncrementCounter("grr_rsa_operations")
-          # Signature is not verified, we consider the message unauthenticated.
-          if remote_public_key.verify(digest, signed_message_list.signature,
-                                      cipher.hash_function_name) != 1:
-            return rdfvalue.GrrMessage.AuthorizationState.UNAUTHENTICATED
-
-        except RSA.RSAError as e:
-          raise communicator.DecryptionError(e)
-
+      if cipher.signature_verified:
         result = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
 
       if result == rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED:
@@ -1648,8 +1637,8 @@ class FrontEndServer(object):
     for task in new_tasks:
       response_message.job.Append(task)
     stats.STATS.IncrementCounter("grr_messages_sent", len(new_tasks))
-    logging.info("Drained %d messages for %s in %s seconds.",
-                 len(new_tasks), client, time.time() - start_time)
+    logging.debug("Drained %d messages for %s in %s seconds.",
+                  len(new_tasks), client, time.time() - start_time)
 
     return new_tasks
 
@@ -1701,8 +1690,8 @@ class FrontEndServer(object):
         for msg in messages:
           manager.QueueResponse(session_id, msg)
 
-    logging.info("Received %s messages in %s sec", len(messages),
-                 time.time() - now)
+    logging.debug("Received %s messages in %s sec", len(messages),
+                  time.time() - now)
 
   def HandleWellKnownFlows(self, messages):
     """Hands off messages to well known flows."""
@@ -1724,7 +1713,12 @@ class FrontEndServer(object):
           queue_manager.QueueManager(token=self.token).DeleteNotification(
               msg.session_id)
 
+          # TODO(user): Deprecate in favor of 'well_known_flow_requests'
+          # metric.
           stats.STATS.IncrementCounter("grr_well_known_flow_requests")
+
+          stats.STATS.IncrementCounter("well_known_flow_requests",
+                                       fields=[str(msg.session_id)])
         else:
           # Message should be queued to be processed in the backend.
 
@@ -1771,3 +1765,13 @@ class FlowInit(registry.InitHook):
     stats.STATS.RegisterCounterMetric("grr_frontendserver_handle_num")
     stats.STATS.RegisterCounterMetric("grr_frontendserver_handle_throttled_num")
     stats.STATS.RegisterGaugeMetric("grr_frontendserver_throttle_setting", str)
+
+    # Flow-aware counters
+    stats.STATS.RegisterCounterMetric("flow_starts",
+                                      fields=[("flow", str)])
+    stats.STATS.RegisterCounterMetric("flow_errors",
+                                      fields=[("flow", str)])
+    stats.STATS.RegisterCounterMetric("flow_completions",
+                                      fields=[("flow", str)])
+    stats.STATS.RegisterCounterMetric("well_known_flow_requests",
+                                      fields=[("flow", str)])

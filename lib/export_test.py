@@ -17,6 +17,8 @@ from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib import test_lib
 
+from grr.proto import export_pb2
+
 
 class DummyRDFValue(rdfvalue.RDFString):
   pass
@@ -81,11 +83,23 @@ class ExportTest(test_lib.GRRBaseTest):
     self.assertTrue(isinstance(result[0], rdfvalue.RDFString))
     self.assertEqual(result[0], "result")
 
-  def testRaisesWhenNoConverterFound(self):
+  def testDoesNotRaiseWhenNoSpecificConverterIsDefined(self):
     dummy_value = DummyRDFValue2("some")
-    result_gen = export.ConvertValues(rdfvalue.ExportedMetadata(),
-                                      [dummy_value])
-    self.assertRaises(export.NoConverterFound, list, result_gen)
+    export.ConvertValues(rdfvalue.ExportedMetadata(),
+                         [dummy_value])
+
+  def testDataAgnosticConverterIsUsedWhenNoSpecificConverterIsDefined(self):
+    original_value = rdfvalue.DataAgnosticConverterTestValue()
+
+    # There's no converter defined for DataAgnosticConverterTestValue, so
+    # we expect DataAgnosticExportConverter to be used.
+    converted_values = list(export.ConvertValues(rdfvalue.ExportedMetadata(),
+                                                 [original_value]))
+    self.assertEqual(len(converted_values), 1)
+    converted_value = converted_values[0]
+
+    self.assertEqual(converted_value.__class__.__name__,
+                     "ExportedDataAgnosticConverterTestValue")
 
   def testConvertsSingleValueWithMultipleAssociatedConverters(self):
     dummy_value = DummyRDFValue3("some")
@@ -601,6 +615,90 @@ class ExportTest(test_lib.GRRBaseTest):
     self.assertEqual(len(results), 1)
     self.assertEqual(results[0].metadata.hostname, "ahostname")
 
+  def testBufferReferenceToExportedMatchConverter(self):
+    buffer_reference = rdfvalue.BufferReference(
+        offset=42, length=43, data="somedata",
+        pathspec=rdfvalue.PathSpec(path="/some/path",
+                                   pathtype=rdfvalue.PathSpec.PathType.OS))
+    metadata = rdfvalue.ExportedMetadata(client_urn="C.0000000000000001")
+
+    converter = export.BufferReferenceToExportedMatchConverter()
+    results = list(converter.Convert(metadata, buffer_reference,
+                                     token=self.token))
+
+    self.assertEqual(len(results), 1)
+    self.assertEqual(results[0].offset, 42)
+    self.assertEqual(results[0].length, 43)
+    self.assertEqual(results[0].data, "somedata")
+    self.assertEqual(
+        results[0].urn,
+        rdfvalue.RDFURN("aff4:/C.0000000000000001/fs/os/some/path"))
+
+  def testFileFinderResultExportConverter(self):
+    pathspec = rdfvalue.PathSpec(path="/some/path",
+                                 pathtype=rdfvalue.PathSpec.PathType.OS)
+
+    match1 = rdfvalue.BufferReference(
+        offset=42, length=43, data="somedata1", pathspec=pathspec)
+    match2 = rdfvalue.BufferReference(
+        offset=44, length=45, data="somedata2", pathspec=pathspec)
+    stat_entry = rdfvalue.StatEntry(
+        aff4path=rdfvalue.RDFURN("aff4:/C.00000000000001/fs/os/some/path"),
+        pathspec=pathspec,
+        st_mode=33184,
+        st_ino=1063090,
+        st_atime=1336469177,
+        st_mtime=1336129892,
+        st_ctime=1336129892)
+
+    file_finder_result = rdfvalue.FileFinderResult(stat_entry=stat_entry,
+                                                   matches=[match1, match2])
+    metadata = rdfvalue.ExportedMetadata(client_urn="C.0000000000000001")
+
+    converter = export.FileFinderResultConverter()
+    results = list(converter.Convert(metadata, file_finder_result,
+                                     token=self.token))
+
+    # We expect 1 ExportedFile instances in the results
+    exported_files = [result for result in results
+                      if isinstance(result, rdfvalue.ExportedFile)]
+    self.assertEqual(len(exported_files), 1)
+
+    self.assertEqual(exported_files[0].basename, "path")
+    self.assertEqual(exported_files[0].urn,
+                     rdfvalue.RDFURN("aff4:/C.00000000000001/fs/os/some/path"))
+    self.assertEqual(exported_files[0].st_mode, 33184)
+    self.assertEqual(exported_files[0].st_ino, 1063090)
+    self.assertEqual(exported_files[0].st_atime, 1336469177)
+    self.assertEqual(exported_files[0].st_mtime, 1336129892)
+    self.assertEqual(exported_files[0].st_ctime, 1336129892)
+
+    self.assertFalse(exported_files[0].HasField("content"))
+    self.assertFalse(exported_files[0].HasField("content_sha256"))
+    self.assertFalse(exported_files[0].HasField("hash_md5"))
+    self.assertFalse(exported_files[0].HasField("hash_sha1"))
+    self.assertFalse(exported_files[0].HasField("hash_sha256"))
+
+    # We expect 2 ExportedMatch instances in the results
+    exported_matches = [result for result in results
+                        if isinstance(result, rdfvalue.ExportedMatch)]
+    exported_matches = sorted(exported_matches, key=lambda x: x.offset)
+    self.assertEqual(len(exported_matches), 2)
+
+    self.assertEqual(exported_matches[0].offset, 42)
+    self.assertEqual(exported_matches[0].length, 43)
+    self.assertEqual(exported_matches[0].data, "somedata1")
+    self.assertEqual(
+        exported_matches[0].urn,
+        rdfvalue.RDFURN("aff4:/C.0000000000000001/fs/os/some/path"))
+
+    self.assertEqual(exported_matches[1].offset, 44)
+    self.assertEqual(exported_matches[1].length, 45)
+    self.assertEqual(exported_matches[1].data, "somedata2")
+    self.assertEqual(
+        exported_matches[1].urn,
+        rdfvalue.RDFURN("aff4:/C.0000000000000001/fs/os/some/path"))
+
   def testRDFURNConverterWithURNPointingToCollection(self):
     urn = rdfvalue.RDFURN("aff4:/C.00000000000000/some/collection")
 
@@ -671,6 +769,106 @@ class ExportTest(test_lib.GRRBaseTest):
     self.assertEqual(results[0].timestamp,
                      rdfvalue.RDFDatetime().FromSecondsFromEpoch(1))
     self.assertEqual(results[0].source_urn, "aff4:/hunts/W:000000/Results")
+
+
+class DataAgnosticConverterTestValue(rdfvalue.RDFProtoStruct):
+  protobuf = export_pb2.DataAgnosticConverterTestValue
+
+
+class DataAgnosticConverterTestValueWithMetadata(rdfvalue.RDFProtoStruct):
+  protobuf = export_pb2.DataAgnosticConverterTestValueWithMetadata
+
+
+class DataAgnosticExportConverterTest(test_lib.GRRBaseTest):
+  """Tests for DataAgnosticExportConverter."""
+
+  def ConvertOriginalValue(self, original_value):
+    converted_values = list(export.DataAgnosticExportConverter().Convert(
+        rdfvalue.ExportedMetadata(source_urn=rdfvalue.RDFURN("aff4:/foo")),
+        original_value))
+    self.assertEqual(len(converted_values), 1)
+    return converted_values[0]
+
+  def testAddsMetadataAndIgnoresRepeatedAndMessagesFields(self):
+    original_value = rdfvalue.DataAgnosticConverterTestValue()
+    converted_value = self.ConvertOriginalValue(original_value)
+
+    # No 'metadata' field in the original value.
+    self.assertListEqual(sorted([t.name for t in original_value.type_infos]),
+                         sorted(["string_value",
+                                 "int_value",
+                                 "repeated_string_value",
+                                 "message_value",
+                                 "enum_value",
+                                 "urn_value",
+                                 "datetime_value"]))
+    # But there's one in the converted value.
+    self.assertListEqual(sorted([t.name for t in converted_value.type_infos]),
+                         sorted(["metadata",
+                                 "string_value",
+                                 "int_value",
+                                 "enum_value",
+                                 "urn_value",
+                                 "datetime_value"]))
+
+    # Metadata value is correctly initialized from user-supplied metadata.
+    self.assertEqual(converted_value.metadata.source_urn,
+                     rdfvalue.RDFURN("aff4:/foo"))
+
+  def testIgnoresPredefinedMetadataField(self):
+    original_value = rdfvalue.DataAgnosticConverterTestValueWithMetadata(
+        metadata=42, value="value")
+    converted_value = self.ConvertOriginalValue(original_value)
+
+    self.assertListEqual(sorted([t.name for t in converted_value.type_infos]),
+                         ["metadata", "value"])
+    self.assertEqual(converted_value.metadata.source_urn,
+                     rdfvalue.RDFURN("aff4:/foo"))
+    self.assertEqual(converted_value.value, "value")
+
+  def testProcessesPrimitiveTypesCorrectly(self):
+    original_value = rdfvalue.DataAgnosticConverterTestValue(
+        string_value="string value",
+        int_value=42,
+        enum_value=rdfvalue.DataAgnosticConverterTestValue.EnumOption.OPTION_2,
+        urn_value=rdfvalue.RDFURN("aff4:/bar"),
+        datetime_value=rdfvalue.RDFDatetime().FromSecondsFromEpoch(42))
+    converted_value = self.ConvertOriginalValue(original_value)
+
+    self.assertEqual(converted_value.string_value.__class__,
+                     original_value.string_value.__class__)
+    self.assertEqual(converted_value.string_value, "string value")
+
+    self.assertEqual(converted_value.int_value.__class__,
+                     original_value.int_value.__class__)
+    self.assertEqual(converted_value.int_value, 42)
+
+    self.assertEqual(converted_value.enum_value.__class__,
+                     original_value.enum_value.__class__)
+    self.assertEqual(converted_value.enum_value,
+                     converted_value.EnumOption.OPTION_2)
+
+    self.assertTrue(isinstance(converted_value.urn_value, rdfvalue.RDFURN))
+    self.assertEqual(converted_value.urn_value, rdfvalue.RDFURN("aff4:/bar"))
+
+    self.assertTrue(isinstance(converted_value.datetime_value,
+                               rdfvalue.RDFDatetime))
+    self.assertEqual(converted_value.datetime_value,
+                     rdfvalue.RDFDatetime().FromSecondsFromEpoch(42))
+
+  def testConvertedValuesCanBeSerializedAndDeserialized(self):
+    original_value = rdfvalue.DataAgnosticConverterTestValue(
+        string_value="string value",
+        int_value=42,
+        enum_value=rdfvalue.DataAgnosticConverterTestValue.EnumOption.OPTION_2,
+        urn_value=rdfvalue.RDFURN("aff4:/bar"),
+        datetime_value=rdfvalue.RDFDatetime().FromSecondsFromEpoch(42))
+    converted_value = self.ConvertOriginalValue(original_value)
+
+    serialized = converted_value.SerializeToString()
+    unserialized_converted_value = converted_value.__class__(serialized)
+
+    self.assertEqual(converted_value, unserialized_converted_value)
 
 
 def main(argv):

@@ -13,6 +13,7 @@ import zlib
 
 import logging
 
+
 from grr.lib import access_control
 from grr.lib import config_lib
 from grr.lib import data_store
@@ -50,15 +51,21 @@ class InstantiationError(Error, IOError):
   pass
 
 
+class ChunkNotFoundError(IOError):
+  pass
+
+
 class Factory(object):
   """A central factory for AFF4 objects."""
 
   def __init__(self):
     # This is a relatively short lived cache of objects.
     self.cache = utils.AgeBasedCache(
-        max_size=10000,
+        max_size=config_lib.CONFIG["AFF4.cache_max_size"],
         max_age=config_lib.CONFIG["AFF4.cache_age"])
-    self.intermediate_cache = utils.FastStore(2000)
+    self.intermediate_cache = utils.AgeBasedCache(
+        max_size=config_lib.CONFIG["AFF4.intermediate_cache_max_size"],
+        max_age=config_lib.CONFIG["AFF4.intermediate_cache_age"])
 
     # Create a token for system level actions:
     self.root_token = rdfvalue.ACLToken(username="system",
@@ -421,8 +428,8 @@ class Factory(object):
 
     return result
 
-  def MultiOpen(self, urns, mode="rw", token=None, aff4_type=None,
-                age=NEWEST_TIME):
+  def MultiOpen(self, urns, mode="rw", ignore_cache=False, token=None,
+                aff4_type=None, age=NEWEST_TIME):
     """Opens a bunch of urns efficiently."""
     if token is None:
       token = data_store.default_token
@@ -433,8 +440,9 @@ class Factory(object):
     symlinks = []
     for urn, values in self.GetAttributes(urns, token=token, age=age):
       try:
-        obj = self.Open(urn, mode=mode, token=token, local_cache={urn: values},
-                        aff4_type=aff4_type, age=age, follow_symlinks=False)
+        obj = self.Open(urn, mode=mode, ignore_cache=ignore_cache, token=token,
+                        local_cache={urn: values}, aff4_type=aff4_type, age=age,
+                        follow_symlinks=False)
         target = obj.Get(obj.Schema.SYMLINK_TARGET)
         if target is not None:
           symlinks.append(target)
@@ -444,8 +452,8 @@ class Factory(object):
         pass
 
     if symlinks:
-      for obj in self.MultiOpen(symlinks, mode=mode, token=token,
-                                aff4_type=aff4_type, age=age):
+      for obj in self.MultiOpen(symlinks, mode=mode, ignore_cache=ignore_cache,
+                                token=token, aff4_type=aff4_type, age=age):
         yield obj
 
   def OpenDiscreteVersions(self, urn, mode="r", ignore_cache=False, token=None,
@@ -625,8 +633,8 @@ class Factory(object):
       count += 1
 
     if count >= limit:
-      logging.info("Object limit reached, there may be further objects "
-                   "to delete.")
+      logging.warning("Object limit reached, there may be further objects "
+                      "to delete.")
 
     # Do not remove the index or deeper objects may become unnavigable.
     data_store.DB.DeleteAttributesRegex(fd.urn, AFF4_PREFIXES,
@@ -2027,12 +2035,15 @@ class AFF4MemoryStream(AFF4Stream):
 
     super(AFF4MemoryStream, self).Close(sync=sync)
 
+  def GetContentAge(self):
+    return self.Get(self.Schema.CONTENT).age
 
-class AFF4ObjectCache(utils.PickleableStore):
+
+class AFF4ObjectCache(utils.FastStore):
   """A cache which closes its objects when they expire."""
 
   def KillObject(self, obj):
-    obj.Close(sync=False)
+    obj.Close(sync=True)
 
 
 class AFF4Image(AFF4Stream):
@@ -2053,6 +2064,14 @@ class AFF4Image(AFF4Stream):
     _CHUNKSIZE = Attribute("aff4:chunksize", rdfvalue.RDFInteger,
                            "Total size of each chunk.", default=64*1024)
 
+    # Note that we can't use CONTENT.age in place of this, since some types
+    # (specifically, AFF4Image) do not have a CONTENT attribute, since they're
+    # stored in chunks. Rather than maximising the last updated time over all
+    # chunks, we store it and update it as an attribute here.
+    CONTENT_LAST = Attribute("metadata:content_last", rdfvalue.RDFDatetime,
+                             "The last time any content was written.",
+                             creates_new_object_version=False)
+
   def Initialize(self):
     """Build a cache for our chunks."""
     super(AFF4Image, self).Initialize()
@@ -2066,8 +2085,10 @@ class AFF4Image(AFF4Stream):
       # pylint: disable=protected-access
       self.chunksize = int(self.Get(self.Schema._CHUNKSIZE))
       # pylint: enable=protected-access
+      self.content_last = self.Get(self.Schema.CONTENT_LAST)
     else:
       self.size = 0
+      self.content_last = None
 
   def SetChunksize(self, chunksize):
     # pylint: disable=protected-access
@@ -2114,6 +2135,8 @@ class AFF4Image(AFF4Stream):
     return fd
 
   def _GetChunkForReading(self, chunk):
+    """Returns the relevant chunk from the datastore and reads ahead."""
+
     chunk_name = self.urn.Add(self.CHUNK_ID_TEMPLATE % chunk)
     try:
       fd = self.chunk_cache.Get(chunk_name)
@@ -2137,7 +2160,7 @@ class AFF4Image(AFF4Stream):
       try:
         fd = self.chunk_cache.Get(chunk_name)
       except KeyError:
-        raise IOError("Cannot open chunk %s" % chunk_name)
+        raise ChunkNotFoundError("Cannot open chunk %s" % chunk_name)
 
     return fd
 
@@ -2181,17 +2204,15 @@ class AFF4Image(AFF4Stream):
     while length > 0:
       data = self._ReadPartial(length)
       if not data:
-        if length > 0:
-          logging.error("Read error: %s bytes read, %s bytes remaining",
-                        len(result), length)
         break
 
       length -= len(data)
       result += data
-
     return result
 
   def _WritePartial(self, data):
+    """Writes at most one chunk of data."""
+
     chunk = self.offset / self.chunksize
     chunk_offset = self.offset % self.chunksize
     data = utils.SmartStr(data)
@@ -2214,24 +2235,17 @@ class AFF4Image(AFF4Stream):
       data = self._WritePartial(data)
 
     self.size = max(self.size, self.offset)
+    self.content_last = rdfvalue.RDFDatetime().Now()
 
   def Flush(self, sync=True):
     """Sync the chunk cache to storage."""
     if self._dirty:
-      chunk_id = self.offset / self.chunksize
-      chunk_name = self.urn.Add(self.CHUNK_ID_TEMPLATE % chunk_id)
-
-      current_chunk = self.chunk_cache.Pop(chunk_name)
-
-      # Flushing the cache will call Close() on all the chunks. We hold on to
-      # the current chunk to ensure it does not get closed.
-      self.chunk_cache.Flush()
-      if current_chunk:
-        current_chunk.Flush(sync=sync)
-        self.chunk_cache.Put(chunk_name, current_chunk)
-
       self.Set(self.Schema.SIZE(self.size))
+      if self.content_last is not None:
+        self.Set(self.Schema.CONTENT_LAST, self.content_last)
 
+    # Flushing the cache will call Close() on all the chunks.
+    self.chunk_cache.Flush()
     super(AFF4Image, self).Flush(sync=sync)
 
   def Close(self, sync=True):
@@ -2242,8 +2256,12 @@ class AFF4Image(AFF4Stream):
     """
     self.Flush(sync=sync)
 
+  def GetContentAge(self):
+    return self.content_last
+
 
 class AFF4NotificationRule(AFF4Object):
+
   def OnWriteObject(self, unused_aff4_object):
     raise NotImplementedError()
 

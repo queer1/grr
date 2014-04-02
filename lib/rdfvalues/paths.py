@@ -22,6 +22,9 @@ import itertools
 import posixpath
 import re
 
+import logging
+
+from grr.lib import artifact_lib
 from grr.lib import rdfvalue
 from grr.lib import utils
 from grr.lib.rdfvalues import structs
@@ -216,11 +219,31 @@ class GlobExpression(rdfvalue.RDFString):
   3) Wild cards like * and ?
   """
 
-  def __str__(self):
-    return "<GlobExpression: %s>" % self._value
+  RECURSION_REGEX = re.compile(r"\*\*(\d*)")
+
+  def Validate(self):
+    """GlobExpression is valid."""
+    if len(self.RECURSION_REGEX.findall(self._value)) > 1:
+      raise ValueError("Only one ** is permitted per path: %s." %
+                       self._value)
 
   def Interpolate(self, client=None):
-    for pattern in self.InterpolateClientAttributes(client=client):
+    try:
+      kb = client.Get(client.Schema.KNOWLEDGE_BASE)
+      if not kb:
+        raise artifact_lib.KnowledgeBaseInterpolationError(
+            "Client has no knowledge base")
+
+      patterns = artifact_lib.InterpolateKbAttributes(self._value, kb)
+    except artifact_lib.KnowledgeBaseInterpolationError:
+      # TODO(user): Deprecate InterpolateClientAttributes() support and
+      # make KnowledgeBase the default and only option as soon as we're
+      # confident that it's fully populated.
+      logging.debug("Can't interpolate glob %s with knowledge base attributes, "
+                    "reverting to client attributes.", utils.SmartUnicode(self))
+      patterns = self.InterpolateClientAttributes(client=client)
+
+    for pattern in patterns:
       # Normalize the component path (this allows us to resolve ../
       # sequences).
       pattern = utils.NormalizePath(pattern.replace("\\", "/"))
